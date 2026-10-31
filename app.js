@@ -1,4 +1,5 @@
 'use strict';
+const VERSION = 'rt-v4';
 /* RDA Rack Track: whitetail movement favorability estimate. All tunables up here. */
 const CFG = {
   BASE: 50,
@@ -23,6 +24,7 @@ const CFG = {
     [12,21,12,31,'Late season',0,'Food is king. Cold snaps push daylight feeding.']],
   PRIME_DAWN: [-60, 120], PRIME_DUSK: [-150, 30],                        // minutes around sunrise / sunset
   DAY_WEIGHTS: {prime: 0.75, midday: 0.25},
+  RAIN_REPORT: {light:[0.05,'Light'], steady:[0.15,'Steady'], heavy:[0.3,'Heavy']}, RAIN_REPORT_MIN: 120,
   CACHE_MIN: 30, KEY_LOCS: 'rt_locs', KEY_CACHE: 'rt_wx2_'
 };
 const $ = s => document.querySelector(s), view = $('#view');
@@ -48,6 +50,10 @@ function rutFor(dateStr){ const [,m,d] = dateStr.split('-').map(Number), k = m*1
 const getLocs = () => { try { return JSON.parse(localStorage.getItem(CFG.KEY_LOCS)) || []; } catch { return []; } };
 const setLocs = l => localStorage.setItem(CFG.KEY_LOCS, JSON.stringify(l));
 
+const rainKey = l => 'rt_rain_' + l.lat.toFixed(3) + ',' + l.lon.toFixed(3);
+function getRain(l){ try { const r = JSON.parse(localStorage.getItem(rainKey(l))); if (r && Date.now() < r.exp) return r; } catch {} localStorage.removeItem(rainKey(l)); return null; }
+function setRain(l, lvl){ if (!lvl) return localStorage.removeItem(rainKey(l)); localStorage.setItem(rainKey(l), JSON.stringify({lvl, at:Date.now(), exp:Date.now()+CFG.RAIN_REPORT_MIN*6e4})); }
+const miles = (a,b,c,d) => { const r=Math.PI/180, x=Math.sin((c-a)*r/2)**2+Math.cos(a*r)*Math.cos(c*r)*Math.sin((d-b)*r/2)**2; return 3958.8*2*Math.asin(Math.sqrt(x)); };
 /* ---------- geocoding ---------- */
 async function geocode(q){
   q = q.trim(); const isZip = /^\d{5}$/.test(q), isAddr = /\d/.test(q) && !isZip || q.includes(',');
@@ -92,15 +98,15 @@ async function nowcast(loc, force){
   const om = getJ(`https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}&current=temperature_2m,precipitation,rain,showers,snowfall,weather_code,cloud_cover,wind_speed_10m,wind_direction_10m,wind_gusts_10m,pressure_msl&minutely_15=precipitation,weather_code&forecast_minutely_15=12&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto`)
     .then(j => { n.om = j.current; n.m15 = j.minutely_15; }).catch(()=>{});
   const nws = (async () => {
-    const pk = 'rt_pt_' + loc.lat.toFixed(3) + ',' + loc.lon.toFixed(3); let pt; try { pt = JSON.parse(localStorage.getItem(pk)); } catch {}
+    const pk = 'rt_pt2_' + loc.lat.toFixed(3) + ',' + loc.lon.toFixed(3); let pt; try { pt = JSON.parse(localStorage.getItem(pk)); } catch {}
     if (!pt) { const p = (await getJ(`https://api.weather.gov/points/${loc.lat.toFixed(4)},${loc.lon.toFixed(4)}`,1)).properties;
-      const st = (await getJ(p.observationStations,1)).features.slice(0,3).map(f=>f.properties.stationIdentifier);
+      const st = (await getJ(p.observationStations,1)).features.slice(0,3).map(f=>({id:f.properties.stationIdentifier, nm:f.properties.name, lat:f.geometry.coordinates[1], lon:f.geometry.coordinates[0]}));
       pt = {st, fh:p.forecastHourly}; localStorage.setItem(pk, JSON.stringify(pt)); }
     await Promise.all([
-      (async () => { for (const id of pt.st) { try { const o = (await getJ(`https://api.weather.gov/stations/${id}/observations/latest`,1)).properties;
+      (async () => { for (const st of pt.st) { const id = st.id; try { const o = (await getJ(`https://api.weather.gov/stations/${id}/observations/latest`,1)).properties;
         const age = (Date.now()-Date.parse(o.timestamp))/6e4; if (age > CFG.OBS_MAX_AGE_MIN || o.temperature.value==null) continue;
         const pw = (o.presentWeather||[]).map(w=>w.rawString||w.weather||'').join(' ');
-        n.obs = {id, ts:o.timestamp, age, txt:o.textDescription||'', pw, t:o.temperature.value*9/5+32,
+        n.obs = {id, nm:st.nm, mi:miles(loc.lat,loc.lon,st.lat,st.lon), ts:o.timestamp, age, txt:o.textDescription||'', pw, t:o.temperature.value*9/5+32,
           w:o.windSpeed.value==null?null:o.windSpeed.value/1.609, wd:o.windDirection.value,
           pr:o.precipitationLastHour&&o.precipitationLastHour.value!=null?o.precipitationLastHour.value/25.4:null}; return; } catch {} } })(),
       (async () => { try { const ps = (await getJ(pt.fh,1)).properties.periods.slice(0,3);
@@ -128,13 +134,16 @@ function nowRead(n){
 }
 
 /* ---------- model ---------- */
-function model(d, nr){
+function model(d, nr, rep){
   const H = d.hourly, n = H.time.length, T = H.time.map(tm), hours = [];
   const curH = nr && nr.omTime ? nr.omTime.slice(0,13)+':00' : null;
+  const nowM = Math.floor((Date.now()/6e4 + (d.utc_offset_seconds||0)/60)/60)*60;
+  const repEnd = rep ? Math.floor(((rep.exp)/6e4 + (d.utc_offset_seconds||0)/60)/60)*60 : 0, repStart = rep ? Math.floor((rep.at/6e4 + (d.utc_offset_seconds||0)/60)/60)*60 : 0;
   for (let i=0;i<n;i++){
     const p = H.pressure_msl, f = {}, live = curH && H.time[i]===curH;
     let t = H.temperature_2m[i], w = H.wind_speed_10m[i], wd = H.wind_direction_10m[i], pr = effPr(H.precipitation[i], H.weather_code&&H.weather_code[i], H.precipitation_probability[i]), pp = H.precipitation_probability[i];
     if (live) { if (nr.t!=null) t = nr.t; if (nr.w!=null) w = nr.w; if (nr.wd!=null) wd = nr.wd; pr = Math.max(pr, nr.rate); pp = Math.max(pp||0, nr.pp2||0, nr.wet?100:0); }
+    const rp = rep && T[i] >= Math.min(repStart,nowM) && T[i] <= repEnd; if (rp) { pr = Math.max(pr, CFG.RAIN_REPORT[rep.lvl][0]); pp = 100; }
     const t24 = i>=24 ? H.temperature_2m[i-24] : null;
     f.temp = band(t, CFG.TEMP_ABS);
     f.change = t24==null ? 0 : clamp(-(t-t24)*CFG.TEMP_DROP_PER_F, CFG.TEMP_RISE_MAX, CFG.TEMP_DROP_MAX);
@@ -147,7 +156,7 @@ function model(d, nr){
             : p[i] >= CFG.PRESS_HIGH ? CFG.PRESS_HIGH_PTS : 0;
     f.rut = rutFor(H.time[i]).bonus;
     const s = clamp(Math.round(CFG.BASE + Object.values(f).reduce((a,b)=>a+b,0)), 0, 100);
-    hours.push({i, m:T[i], time:H.time[i], s, f, t, w, g:H.wind_gusts_10m[i], wd, cc:H.cloud_cover[i], pr, pp:pp||0, p:p[i], dp:d3, live});
+    hours.push({i, m:T[i], time:H.time[i], s, f, t, w, g:H.wind_gusts_10m[i], wd, cc:H.cloud_cover[i], pr, pp:pp||0, p:p[i], dp:d3, live, rp});
   }
   const days = d.daily.time.map((date, k) => {
     const sr = tm(d.daily.sunrise[k]), ss = tm(d.daily.sunset[k]);
@@ -159,7 +168,7 @@ function model(d, nr){
     const score = Math.round(pa==null ? (avg(hs)||0) : ma==null ? pa : pa*CFG.DAY_WEIGHTS.prime + ma*CFG.DAY_WEIGHTS.midday);
     const src = prime.length ? prime : hs, fs = {};
     for (const key of ['temp','change','wind','cloud','precip','press']) fs[key] = src.reduce((a,h)=>a+h.f[key],0)/(src.length||1);
-    return {date, k, sr, ss, hs, score, fs, reason: reason(fs, hs, src), rut: rutFor(date)};
+    return {date, k, sr, ss, hs, rp: hs.some(h=>h.rp), score, fs, reason: reason(fs, hs, src), rut: rutFor(date)};
   });
   return {hours, days: days.slice(1)}; // drop the past day (only used for day-over-day change)
 }
@@ -185,7 +194,7 @@ function fine(d, mdl, day){
     const h = hs[hi], f = {...h.f};
     f.temp = band(M.temperature_2m[j], CFG.TEMP_ABS);
     f.wind = band(M.wind_speed_10m[j], CFG.WIND) + (M.wind_gusts_10m[j] > CFG.GUST_PENALTY_OVER ? CFG.GUST_PENALTY : 0);
-    const pr15 = Math.max(effPr((M.precipitation[j]||0)*4, M.weather_code&&M.weather_code[j], h.pp), h.live?h.pr:0);
+    const pr15 = Math.max(effPr((M.precipitation[j]||0)*4, M.weather_code&&M.weather_code[j], h.pp), (h.live||h.rp)?h.pr:0);
     f.precip = band(pr15, CFG.PRECIP);
     out.push({m, s: clamp(Math.round(CFG.BASE + Object.values(f).reduce((a,b)=>a+b,0)),0,100), t:M.temperature_2m[j], w:M.wind_speed_10m[j], g:M.wind_gusts_10m[j], wd:M.wind_direction_10m[j], pr:pr15, cc:h.cc, p:h.p, dp:h.dp, pp:h.pp});
   }
@@ -213,7 +222,7 @@ function chart(pts, key, opt){
     else g += `<path d="${d}" fill="none" stroke="${opt.color}" stroke-width="2" stroke-linejoin="round"/>`;
     if (opt.key2) g += `<path d="${pts.map((p,i)=>(i?'L':'M')+X(p.m).toFixed(1)+' '+Y(p[opt.key2]).toFixed(1)).join('')}" fill="none" stroke="${opt.color}" stroke-width="1" stroke-dasharray="3 3" opacity=".7"/>`;
   }
-  if (opt.arrows){ const per = pts.length > 30 ? Math.round(pts.length/8) : 3; for (let i=Math.floor(per/2);i<pts.length;i+=per){ const p = pts[i]; g += `<text x="${X(p.m)}" y="${Tp+9}" fill="#e6e9ee" font-size="9" font-weight="600" text-anchor="middle" opacity=".85">${compass16(p.wd)}</text>`; } }
+  if (opt.dirs){ const per = pts.length > 30 ? Math.round(pts.length/8) : 3; for (let i=Math.floor(per/2);i<pts.length;i+=per){ const p = pts[i]; g += `<text x="${X(p.m)}" y="${Tp+9}" fill="#e6e9ee" font-size="9" font-weight="600" text-anchor="middle" opacity=".85">${compass16(p.wd)}</text>`; } }
   g += `<line class="cur" x1="0" x2="0" y1="${Tp}" y2="${H-B}" stroke="#ff9a52" stroke-width="1" opacity="0"/>`;
   return `<svg class="chart" viewBox="0 0 ${W} ${H}" data-x0="${x0}" data-x1="${x1}" data-l="${L}" data-r="${R}" data-w="${W}">${g}</svg>`;
 }
@@ -242,7 +251,7 @@ function home(){
   view.innerHTML = `<form class="add" id="addF"><input id="q" placeholder="Zip code or address" autocomplete="postal-code" enterkeyhint="go"><button class="btn">Add</button></form>
   <button class="btn ghost" id="geo">📍 Use my location</button><div class="msg" id="msg"></div>
   <div id="cards">${locs.length ? '' : '<div class="card" style="color:var(--mut)">Add a zip code (try 54020) or an address to see the 7-day deer movement outlook.</div>'}</div>
-  <div class="note">An estimate from weather and calendar patterns, not a guarantee. Weather: Open-Meteo, NWS. Built by Rusty Dingo Arms.</div>`;
+  <div class="note">An estimate from weather and calendar patterns, not a guarantee. Weather: Open-Meteo, NWS. Built by Rusty Dingo Arms. <span class="ver">${VERSION}</span></div>`;
   $('#addF').onsubmit = async e => { e.preventDefault(); const q = $('#q').value; if (!q.trim()) return; $('#msg').textContent = 'Finding…';
     const g = await geocode(q); if (!g) { $('#msg').textContent = 'Could not find that location. Try a 5-digit zip or "City, ST".'; return; }
     setLocs([...getLocs(), g]); home(); };
@@ -252,21 +261,27 @@ function home(){
       setLocs([...getLocs(), {name, lat, lon}]); home(); }, () => { $('#msg').textContent = 'Location permission denied.'; }, {timeout:15000}); };
   locs.forEach((l,idx) => renderCard(l, idx, locs.length));
 }
-async function renderCard(l, idx, n){
-  const el = document.createElement('div'); el.className = 'card'; $('#cards').appendChild(el);
+async function renderCard(l, idx, n, el){
+  if (!el) { el = document.createElement('div'); el.className = 'card'; $('#cards').appendChild(el); }
   const head = `<div class="ch"><h3>${esc(l.name)}</h3><button class="iconbtn sm" data-a="up" ${idx?'':'disabled'} aria-label="Move up">↑</button><button class="iconbtn sm" data-a="dn" ${idx<n-1?'':'disabled'} aria-label="Move down">↓</button><button class="iconbtn sm" data-a="rm" aria-label="Remove">✕</button></div>`;
   el.innerHTML = head + '<div class="msg">Loading forecast…</div>';
   const act = a => { const L = getLocs(); if (a==='rm'){ if(!confirm('Remove '+l.name+'?')) return; L.splice(idx,1); } else { const j = a==='up'?idx-1:idx+1; [L[idx],L[j]] = [L[j],L[idx]]; } setLocs(L); home(); };
   const bind = () => el.querySelectorAll('[data-a]').forEach(b => b.onclick = () => act(b.dataset.a));
   bind();
   try {
-    const [c, nc] = await Promise.all([weather(l), nowcast(l).catch(()=>null)]), nr = nc ? nowRead(nc) : null, mdl = model(c.d, nr); state.data[idx] = c.d; state.models[idx] = mdl;
+    const [c, nc] = await Promise.all([weather(l), nowcast(l).catch(()=>null)]), nr = nc ? nowRead(nc) : null, rep = getRain(l), mdl = model(c.d, nr, rep); state.data[idx] = c.d; state.models[idx] = mdl;
     const lh = mdl.hours.find(h=>h.live);
-    const strip = nr ? `<div class="now"><div class="nowt"><b>Right now</b>${lh?` <span class="sc sm" style="background:${color(lh.s)}">${lh.s}</span>`:''}</div><div class="nowv">${nr.t!=null?Math.round(nr.t)+'°F':''} · ${nr.w!=null?Math.round(nr.w)+' mph '+(nr.wd!=null?compass16(nr.wd):''):''} · ${esc(nr.sky)} · <b style="color:${nr.wet?'#5aa9ff':'inherit'}">${nr.wet?'Wet '+nr.rate.toFixed(2)+'"/hr':'Dry'}</b>${lh?` (${lh.f.precip} pts)`:''}</div><small>Next 2 hr: ${nr.next2>0.004?'rain '+nr.next2.toFixed(2)+'"/hr':'no rain modeled'}${nr.h0?' · NWS '+nr.pp2+'% · '+esc(nr.h0.txt):''}<br>${nr.ob?`NWS ${nr.ob.id} obs ${fmtClock(nr.ob.ts)}`:'No nearby NWS obs'}${nr.omTime?` · Open-Meteo ${fmtT(tm(nr.omTime))}`:''}${nc.stale?' · offline':''}</small></div>` : '';
+    const strip = nr ? `<div class="now"><div class="nowt"><b>Right now</b>${lh?` <span class="sc sm" style="background:${color(lh.s)}">${lh.s}</span>`:''}</div><div class="nowv">${nr.t!=null?Math.round(nr.t)+'°F':''} · ${nr.w!=null?Math.round(nr.w)+' mph '+(nr.wd!=null?compass16(nr.wd):''):''} · ${esc(nr.sky)} · <b style="color:${nr.wet||rep?'#5aa9ff':'inherit'}">${rep?'Rain (you)':nr.wet?'Wet '+nr.rate.toFixed(2)+'"/hr':'Dry'}</b>${lh?` (${lh.f.precip} pts)`:''}</div><small>Next 2 hr: ${nr.next2>0.004?'rain '+nr.next2.toFixed(2)+'"/hr':'no rain modeled'}${nr.h0?' · NWS '+nr.pp2+'% · '+esc(nr.h0.txt):''}<br>📍 ${esc(l.name)} · ${nr.ob?`NWS ${nr.ob.id}${nr.ob.mi!=null?' ('+Math.round(nr.ob.mi)+' mi away)':''} obs ${fmtClock(nr.ob.ts)}`:'No nearby NWS obs'}${nr.omTime?` · Open-Meteo ${fmtT(tm(nr.omTime))}`:''}${nc.stale?' · offline':''}</small>${rainUI(rep)}</div>` : rainUI(rep);
     el.innerHTML = head + strip + (c.stale?'<div class="msg">Offline: showing last saved forecast.</div>':'') + '<div class="days">' + mdl.days.map((d,k) => { const dt = new Date(Date.UTC(...d.date.split('-').map((v,i)=>i==1?v-1:+v)));
       return `<button class="day" data-k="${k}"><div class="dn"><b>${k===0?'Today':DOW[dt.getUTCDay()]}</b><small>${dt.getUTCMonth()+1}/${dt.getUTCDate()}</small></div><div class="sc" style="background:${color(d.score)}">${d.score}</div><div class="why"><b>${label(d.score)}</b> · ${d.rut.name}<br>${esc(d.reason)}</div></button>`; }).join('') + '</div>';
-    bind(); el.querySelectorAll('.day').forEach(b => b.onclick = () => detail(idx, +b.dataset.k));
+    bind(); el.querySelectorAll('[data-rain]').forEach(b => b.onclick = () => { setRain(l, b.dataset.rain); delete state.data[idx]; renderCard(l, idx, n, el); });
+    el.querySelectorAll('.day').forEach(b => b.onclick = () => detail(idx, +b.dataset.k));
   } catch (e) { el.innerHTML = head + `<div class="msg">Forecast unavailable (${esc(e.message)}). Check your connection.</div>`; bind(); }
+}
+function rainUI(rep){
+  const lv = Object.entries(CFG.RAIN_REPORT);
+  if (rep) return `<div class="rain on">🌧 <b>You reported ${CFG.RAIN_REPORT[rep.lvl][1].toLowerCase()} rain at ${fmtClock(rep.at)}</b> <small>(applies through ${fmtClock(rep.exp)})</small><div class="rbtns">${lv.map(([k,v])=>`<button class="rb ${k===rep.lvl?'on':''}" data-rain="${k}">${v[1]}</button>`).join('')}<button class="rb clr" data-rain="">☀ Not raining</button></div></div>`;
+  return `<div class="rain"><span>Raining where you are?</span><div class="rbtns"><button class="rb main" data-rain="light">🌧 Raining here</button>${lv.slice(1).map(([k,v])=>`<button class="rb" data-rain="${k}">${v[1]}</button>`).join('')}</div></div>`;
 }
 function detail(idx, k){
   const l = getLocs()[idx], d = state.data[idx], mdl = state.models[idx], day = mdl.days[k]; if (!day) return home();
@@ -282,13 +297,13 @@ function detail(idx, k){
       <div class="card"><div class="tabs">${f15?`<button class="tab ${res==='15'?'on':''}" data-r="15">15-min</button>`:''}<button class="tab ${res==='60'?'on':''}" data-r="60">Hourly</button></div>
       <div class="tip" id="tip">Tap or drag a chart. Orange bands are the dawn/dusk prime windows; dark is night.</div>
       <div class="ct"><span>Favorability</span><span>0–100</span></div>${chart(pts,'s',{day,min:0,max:100,grad:1,h:130})}
-      <div class="ct"><span>Temperature °F</span><span>${Math.round(pts[0].t)}° → ${Math.round(pts[pts.length-1].t)}°</span></div>${chart(pts,'t',{day,color:'#ff9a52',span:6})}
-      <div class="ct"><span>Wind mph (dashed = gusts), letters = direction wind is FROM</span></div>${chart(pts,'w',{day,color:'#5aa9ff',key2:'g',min:0,arrows:1,span:10})}
+      <div class="ct"><span>Temperature °F</span><span>${Math.round(pts[0].t)}° to ${Math.round(pts[pts.length-1].t)}°</span></div>${chart(pts,'t',{day,color:'#ff9a52',span:6})}
+      <div class="ct"><span>Wind mph (dashed = gusts), letters = direction wind is FROM</span></div>${chart(pts,'w',{day,color:'#5aa9ff',key2:'g',min:0,dirs:1,span:10})}
       <div class="ct"><span>Cloud cover %</span></div>${chart(pts,'cc',{day,color:'#8a94a3',min:0,max:100})}
       <div class="ct"><span>Precipitation in/${res==='15'?'15 min':'hr'}</span><span>max chance ${Math.max(...day.hs.map(h=>h.pp||0))}%</span></div>${chart(pts,'pr',{day,color:'#5aa9ff',min:0,bars:1,span:0.05,fmt:v=>v.toFixed(2)})}
       <div class="ct"><span>Rain chance %</span><span>Open-Meteo hourly</span></div>${chart(pts,'pp',{day,color:'#5aa9ff',min:0,max:100})}
       <div class="ct"><span>Pressure hPa (trend)</span><span>${(day.hs[day.hs.length-1].p-day.hs[0].p>0?'▲ ':'▼ ')+Math.abs(day.hs[day.hs.length-1].p-day.hs[0].p).toFixed(1)} today</span></div>${chart(pts,'p',{day,color:'#3ecf8e',span:4})}</div>
-      <div class="card"><b>Factor breakdown (prime windows)</b><div class="facts" style="margin-top:8px">${fsRow}</div></div>
+      <div class="card"><b>Factor breakdown (prime windows)</b><div class="facts" style="margin-top:8px">${fsRow}</div>${day.rp?`<div class="msg" style="color:#5aa9ff">Precipitation includes your "raining here" report (${CFG.RAIN_REPORT[getRain(l).lvl][1].toLowerCase()} rain, ${fmtClock(getRain(l).at)}) for the current and next 2 hours.</div>`:''}</div>
       <div class="note">Estimate only. Check regulations for legal shooting hours.</div>`;
     view.querySelectorAll('.tab').forEach(b => b.onclick = () => { res = b.dataset.r; draw(); });
     bindCharts(pts, $('#tip'));
@@ -304,12 +319,17 @@ $('#howBody').innerHTML = `<h2>How the score works</h2><p>Each hour starts at <b
 <li><b>Clouds:</b> clear to partly cloudy is best for daylight movement. Heavy overcast is slightly negative.</li>
 <li><b>Precipitation:</b> light drizzle costs a little, steady rain more, and heavy rain or snow is bad, especially for mature bucks. The app uses the larger of the forecast amount, what the weather code implies (drizzle, rain, showers, snow, storms) and a high rain chance, so a rainy hour never scores as dry.</li>
 <li><b>Right now:</b> each card blends the nearest NWS station observation (US), Open-Meteo's current reading and 15-minute nowcast, and the NWS hourly forecast. The current hour's score uses observed temperature, wind and rain. Refreshed every ${CFG.NOW_CACHE_MIN} minutes.</li>
+<li><b>Raining here:</b> if it's raining on you but the data says dry, tap <b>Raining here</b> on the card (Light, Steady or Heavy). It counts as rain for this hour and the next 2 hours, then expires. Tap <b>Not raining</b> to clear.</li>
 <li><b>Pressure and fronts:</b> falling pressure ahead of a front (+${CFG.PRESS_FALL_PTS}) and rising pressure right after one passes (+${CFG.POST_FRONT_PTS}) trigger feeding. Steady high pressure is about average.</li>
 <li><b>Rut phase</b> (northern MN/WI calendar): pre-rut Oct 20–31 +5, seeking Nov 1–7 +10, peak breeding Nov 8–18 +8, post-rut Nov 19–30 +3, second rut about Dec 5–20 +4.</li></ul>
-<p>Colors: <span style="color:#3ecf8e">75+ excellent</span> · <span style="color:#a6d94a">60 good</span> · <span style="color:#f2b84b">45 fair</span> · <span style="color:#e8792b">30 poor</span> · <span style="color:#ff5d5d">under 30 tough</span>. 15-minute charts use Open-Meteo's 15-minute data where it's available (most of the US). Cloud cover and pressure come from the hourly data. Forecasts are cached for ${CFG.CACHE_MIN} minutes and stay available offline.</p>`;
+<p>Colors: <span style="color:#3ecf8e">75+ excellent</span> · <span style="color:#a6d94a">60 good</span> · <span style="color:#f2b84b">45 fair</span> · <span style="color:#e8792b">30 poor</span> · <span style="color:#ff5d5d">under 30 tough</span>. 15-minute charts use Open-Meteo's 15-minute data where it's available (most of the US). Cloud cover and pressure come from the hourly data. Forecasts are cached for ${CFG.CACHE_MIN} minutes and stay available offline.</p><p class="ver">Version ${VERSION}</p>`;
 $('#howBtn').onclick = () => $('#sheet').hidden = false;
 $('#closeHow').onclick = $('#sheet').onclick = e => { if (e.target.id==='sheet'||e.currentTarget.id==='closeHow') $('#sheet').hidden = true; };
 $('#back').onclick = () => home();
 window.addEventListener('hashchange', () => { if (!location.hash && !$('#back').hidden) home(); });
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(()=>{});
+if ('serviceWorker' in navigator) {
+  const had = !!navigator.serviceWorker.controller; let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (had && !reloaded) { reloaded = true; location.reload(); } });
+  navigator.serviceWorker.register('sw.js', {updateViaCache:'none'}).then(r => { r.update(); document.addEventListener('visibilitychange', () => { if (!document.hidden) r.update(); }); }).catch(()=>{});
+}
 setRut(); home();
