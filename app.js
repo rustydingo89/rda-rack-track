@@ -205,7 +205,7 @@ function fine(d, mdl, day){
 function chart(pts, key, opt){
   const W = 360, H = opt.h||110, L = 30, R = 6, Tp = 8, B = 18, x0 = pts[0].m, x1 = pts[pts.length-1].m;
   const vals = pts.map(p=>p[key]); let lo = opt.min ?? Math.min(...vals), hi = opt.max ?? Math.max(...vals);
-  if (hi-lo < (opt.span||1)) { const c=(hi+lo)/2; lo=c-(opt.span||1)/2; hi=c+(opt.span||1)/2; }
+  if (hi-lo < (opt.span||1)) { const c=(hi+lo)/2; lo=c-(opt.span||1)/2; hi=c+(opt.span||1)/2; } if (opt.min!=null && lo<opt.min){ hi+=opt.min-lo; lo=opt.min; }
   const X = m => L + (m-x0)/(x1-x0||1)*(W-L-R), Y = v => Tp + (1-(v-lo)/(hi-lo||1))*(H-Tp-B);
   let g = '';
   const {sr, ss} = opt.day;
