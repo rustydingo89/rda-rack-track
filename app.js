@@ -69,10 +69,10 @@ const miles = (a,b,c,d) => { const r=Math.PI/180, x=Math.sin((c-a)*r/2)**2+Math.
 async function geocode(q){
   q = q.trim(); const isZip = /^\d{5}$/.test(q), isAddr = /\d/.test(q) && !isZip || q.includes(',');
   const om = async () => { const r = await (await fetch('https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&format=json&name='+encodeURIComponent(q)+(isZip?'&countryCode=US':''))).json();
-    const g = r.results && r.results[0]; return g && {name:(isZip?q+' · ':'')+g.name+(g.admin1?', '+g.admin1:''), lat:g.latitude, lon:g.longitude}; };
+    const g = r.results && r.results[0]; return g && {name:(isZip?q+' · ':'')+g.name+(g.admin1?', '+g.admin1:''), lat:g.latitude, lon:g.longitude, st:g.admin1||''}; };
   const nm = async () => { const r = await (await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&addressdetails=1&q='+encodeURIComponent(q))).json();
     const g = r[0]; if (!g) return null; const a = g.address||{};
-    return {name:(isZip?q+' · ':'')+(a.city||a.town||a.village||a.hamlet||a.county||g.display_name.split(',')[0])+(a.state?', '+a.state:''), lat:+g.lat, lon:+g.lon}; };
+    return {name:(isZip?q+' · ':'')+(a.city||a.town||a.village||a.hamlet||a.county||g.display_name.split(',')[0])+(a.state?', '+a.state:''), lat:+g.lat, lon:+g.lon, st:a.state||''}; };
   const order = isAddr ? [nm, om] : [om, nm];
   for (const f of order) { try { const g = await f(); if (g) return g; } catch (e) {} }
   return null;
@@ -251,6 +251,16 @@ function bestWindow(pts, day){
     const a = v.reduce((x,q)=>x+q.s,0)/v.length; if (!best || a > best[2]) best = [p.m, p.m+120, a]; }
   return best || [D[0]?.m||pts[0].m, (D[0]?.m||pts[0].m)+120, (D[0]||pts[0]).s];
 }
+/* ---------- legal shooting hours (deer) ---------- */
+const LEGAL = {
+  MN: {pre:30, post:30, rule:'½ hour before sunrise to ½ hour after sunset', src:'https://www.revisor.mn.gov/statutes/cite/97B.075', srcName:'Minn. Stat. 97B.075(b) (big game)'},
+  WI: {pre:30, post:20, rule:'30 min before sunrise to 20 min after sunset', src:'https://dnr.wisconsin.gov/topic/Hunt/regulations/OnlineHuntingRegulations/ShootingHoursDeerBearElkSmallGameFallTurkey', srcName:'WI DNR deer shooting hours tables', note:'WI officially uses printed DNR tables by area and longitude zone; this is computed from local sunrise/sunset and may differ by a few minutes.'}};
+const ST_ABBR = {minnesota:'MN', wisconsin:'WI', mn:'MN', wi:'WI'};
+function locState(l){ const raw = (l.st || (String(l.name).split(',').pop()||'')).trim().toLowerCase(); return ST_ABBR[raw] || null; }
+async function ensureState(l, idx){ if (l.st != null && l.st !== '') return; if (locState(l)) return;
+  try { const r = await (await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&zoom=5&lat=${l.lat}&lon=${l.lon}`)).json(); const st = (r.address||{}).state||'-';
+    const L = getLocs(); if (L[idx] && L[idx].lat===l.lat) { L[idx].st = st; setLocs(L); } l.st = st; } catch {} }
+const legalFor = (l, day) => { const r = LEGAL[locState(l)]; return r ? {a: day.sr - r.pre, b: day.ss + r.post, r} : null; };
 /* ---------- SVG charts ---------- */
 function chart(pts, key, opt){
   const W = 360, H = opt.h||110, L = 30, R = 8, Tp = opt.dirs ? 18 : 8, B = 18, x0 = pts[0].m, x1 = pts[pts.length-1].m;
@@ -261,6 +271,7 @@ function chart(pts, key, opt){
   let g = '';
   const {sr, ss} = opt.day;
   g += `<rect x="${L}" y="${Tp}" width="${Math.max(0,X(sr)-L)}" height="${H-Tp-B}" fill="#000" opacity=".35"/><rect x="${X(ss)}" y="${Tp}" width="${Math.max(0,W-R-X(ss))}" height="${H-Tp-B}" fill="#000" opacity=".35"/>`;
+  if (opt.legal){ const la = X(Math.max(x0,opt.legal.a)), lb = X(Math.min(x1,opt.legal.b)); g += `<rect x="${la}" y="${H-B-3}" width="${Math.max(0,lb-la)}" height="3" fill="#3ecf8e" opacity=".8"/><line x1="${la}" x2="${la}" y1="${Tp}" y2="${H-B}" stroke="#3ecf8e" stroke-width=".8" stroke-dasharray="2 3" opacity=".7"/><line x1="${lb}" x2="${lb}" y1="${Tp}" y2="${H-B}" stroke="#3ecf8e" stroke-width=".8" stroke-dasharray="2 3" opacity=".7"/>`; }
   for (const [a,b] of [[sr+CFG.PRIME_DAWN[0], sr+CFG.PRIME_DAWN[1]], [ss+CFG.PRIME_DUSK[0], ss+CFG.PRIME_DUSK[1]]])
     g += `<rect x="${X(a)}" y="${Tp}" width="${X(b)-X(a)}" height="${H-Tp-B}" fill="#e8792b" opacity=".13"/>`;
   if (opt.bands) for (const [a,b,nm,c] of CFG.BANDS){ const ya = Y(clamp(a,lo,hi)), yb = Y(clamp(b,lo,hi)); if (ya-yb < 1) continue;
@@ -314,9 +325,9 @@ function home(){
     const g = await geocode(q); if (!g) { $('#msg').textContent = 'Could not find that location. Try a 5-digit zip or "City, ST".'; return; }
     setLocs([...getLocs(), g]); home(); };
   $('#geo').onclick = () => { if (!navigator.geolocation) { $('#msg').textContent = 'Location not available.'; return; } $('#msg').textContent = 'Getting location…';
-    navigator.geolocation.getCurrentPosition(async p => { const lat = +p.coords.latitude.toFixed(4), lon = +p.coords.longitude.toFixed(4); let name = 'My location';
-      try { const r = await (await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&zoom=10&lat=${lat}&lon=${lon}`)).json(); const a = r.address||{}; name = '📍 '+(a.city||a.town||a.village||a.county||'My location')+(a.state?', '+a.state:''); } catch {}
-      setLocs([...getLocs(), {name, lat, lon}]); home(); }, () => { $('#msg').textContent = 'Location permission denied.'; }, {timeout:15000}); };
+    navigator.geolocation.getCurrentPosition(async p => { const lat = +p.coords.latitude.toFixed(4), lon = +p.coords.longitude.toFixed(4); let name = 'My location', stName = '';
+      try { const r = await (await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&zoom=10&lat=${lat}&lon=${lon}`)).json(); const a = r.address||{}; stName = a.state||''; name = '📍 '+(a.city||a.town||a.village||a.county||'My location')+(a.state?', '+a.state:''); } catch {}
+      setLocs([...getLocs(), {name, lat, lon, st:stName}]); home(); }, () => { $('#msg').textContent = 'Location permission denied.'; }, {timeout:15000}); };
   locs.forEach((l,idx) => renderCard(l, idx, locs.length));
 }
 async function renderCard(l, idx, n, el){
@@ -327,11 +338,11 @@ async function renderCard(l, idx, n, el){
   const bind = () => el.querySelectorAll('[data-a]').forEach(b => b.onclick = () => act(b.dataset.a));
   bind();
   try {
-    const [c, nc] = await Promise.all([weather(l), nowcast(l).catch(()=>null)]), nr = nc ? nowRead(nc) : null, rep = getRain(l), mdl = model(c.d, nr, rep); state.data[idx] = c.d; state.models[idx] = mdl;
+    const [c, nc] = await Promise.all([weather(l), nowcast(l).catch(()=>null), ensureState(l, idx)]), nr = nc ? nowRead(nc) : null, rep = getRain(l), mdl = model(c.d, nr, rep); state.data[idx] = c.d; state.models[idx] = mdl;
     const lh = mdl.hours.find(h=>h.live);
     const strip = nr ? `<div class="now"><div class="nowt"><b>Right now</b>${lh?` <span class="sc sm" style="background:${color(lh.s)}">${lh.s}</span>`:''}</div><div class="nowv">${nr.t!=null?Math.round(nr.t)+'°F':''} · ${nr.w!=null?Math.round(nr.w)+' mph '+(nr.wd!=null?compass16(nr.wd):''):''} · ${esc(nr.sky)} · <b style="color:${nr.wet||rep?'#5aa9ff':'inherit'}">${rep?'Rain (you)':nr.wet?'Wet '+nr.rate.toFixed(2)+'"/hr':'Dry'}</b>${lh&&lh.f.precip<-0.5?` (${Math.round(lh.f.precip)} pts)`:''}</div><small>Next hour: <b>${nr.firstWet?(nr.firstWet.in<=0?'raining now':'rain in ~'+nr.firstWet.in+' min')+' ('+nr.firstWet.rate.toFixed(2)+'"/hr, Open-Meteo 15-min)':'no rain in Open-Meteo 15-min nowcast'}</b> · next 2 hr max ${nr.next2>0.004?nr.next2.toFixed(2)+'"/hr':'dry'}${nr.h0?' · NWS '+nr.pp2+'% · '+esc(nr.h0.txt):''}<br>📍 ${esc(l.name)} · ${nr.ob?`NWS ${nr.ob.id}${nr.ob.mi!=null?' ('+Math.round(nr.ob.mi)+' mi away)':''} obs ${fmtClock(nr.ob.ts)}`:'No nearby NWS obs'}${nr.omTime?` · Open-Meteo ${fmtT(tm(nr.omTime))}`:''}${nc.stale?' · offline':''}</small>${rainUI(rep)}</div>` : rainUI(rep);
     el.innerHTML = head + strip + (c.stale?'<div class="msg">Offline: showing last saved forecast.</div>':'') + '<div class="days">' + mdl.days.map((d,k) => { const dt = new Date(Date.UTC(...d.date.split('-').map((v,i)=>i==1?v-1:+v)));
-      return `<button class="day" data-k="${k}"><div class="dn"><b>${k===0?'Today':DOW[dt.getUTCDay()]}</b><small>${dt.getUTCMonth()+1}/${dt.getUTCDate()}</small></div><div class="sc" style="background:${color(d.score)}">${d.score}</div><div class="why"><b>${label(d.score)}</b> · ${d.rut.name}<br>${esc(d.reason)}</div></button>`; }).join('') + '</div>';
+      return `<button class="day" data-k="${k}"><div class="dn"><b>${k===0?'Today':DOW[dt.getUTCDay()]}</b><small>${dt.getUTCMonth()+1}/${dt.getUTCDate()}</small></div><div class="sc" style="background:${color(d.score)}">${d.score}</div><div class="why"><b>${label(d.score)}</b> · ${d.rut.name}<br>${esc(d.reason)}<br><small class="mut">☀ ${fmtT(d.sr)}–${fmtT(d.ss)}${(lg=>lg?` · <span style="color:#3ecf8e">Legal ${fmtT(lg.a)}–${fmtT(lg.b)}</span>`:'')(legalFor(l,d))}</small></div></button>`; }).join('') + '</div>';
     bind(); el.querySelectorAll('[data-rain]').forEach(b => b.onclick = () => { setRain(l, b.dataset.rain); delete state.data[idx]; renderCard(l, idx, n, el); });
     el.querySelectorAll('.day').forEach(b => b.onclick = () => detail(idx, +b.dataset.k));
   } catch (e) { el.innerHTML = head + `<div class="msg">Forecast unavailable (${esc(e.message)}). Check your connection.</div>`; bind(); }
@@ -344,7 +355,7 @@ function rainUI(rep){
 function detail(idx, k){
   const l = getLocs()[idx], d = state.data[idx], mdl = state.models[idx], day = mdl.days[k]; if (!day) return home();
   location.hash = 'd'; $('#back').hidden = false; window.scrollTo(0,0);
-  const f15 = fine(d, mdl, day); let res = f15 ? '15' : '60';
+  const f15 = fine(d, mdl, day), lg = legalFor(l, day), lgTxt = lg ? `${fmtT(lg.a)} – ${fmtT(lg.b)}` : 'n/a (state unknown)'; let res = f15 ? '15' : '60';
   const draw = () => {
     const pts = res==='15' && f15 ? f15 : day.hs, dt = new Date(Date.UTC(...day.date.split('-').map((v,i)=>i==1?v-1:+v)));
     const best = [...day.hs].filter(h=>h.m>=day.sr-60&&h.m<=day.ss+30).sort((a,b)=>b.s-a.s)[0] || day.hs[0];
@@ -356,19 +367,19 @@ function detail(idx, k){
     const fsRow = Object.entries(day.fs).map(([kk,v])=>`<div class="fact"><small>${{temp:'Temperature',change:'Change vs yesterday',wind:'Wind',cloud:'Sky (cloud × temp)',precip:'Rain / snow / fog',press:'Pressure / fronts',rut:'Rut phase'}[kk]}</small><b style="color:${v>0.5?'#3ecf8e':v<-0.5?'#ff5d5d':'#e6e9ee'}">${v>0?'+':''}${v.toFixed(1)} pts</b></div>`).join('');
     view.innerHTML = `<div class="card"><div class="ch"><h3>${esc(l.name)} · ${DOW[dt.getUTCDay()]} ${dt.getUTCMonth()+1}/${dt.getUTCDate()}</h3><div class="sc" style="background:${color(day.score)}">${day.score}</div></div>
       <div class="why"><b>${label(day.score)}</b> · ${esc(day.reason)}</div>
-      <div class="facts" style="margin-top:10px"><div class="fact"><small>Sunrise / Sunset</small><b>${fmtT(day.sr)} / ${fmtT(day.ss)}</b></div><div class="fact"><small>Best hour (daylight)</small><b>${fmtT(best.m)} · ${best.s}</b></div><div class="fact"><small>Rut phase</small><b>${day.rut.name}${day.rut.bonus?' +'+day.rut.bonus:''}</b></div><div class="fact"><small>Prevailing wind (daylight)</small><b>${prevail(day.hs.filter(h=>h.m>=day.sr&&h.m<=day.ss))} · ${Math.round(Math.max(...day.hs.map(h=>h.w)))} mph max</b></div><div class="fact"><small>Temp range</small><b>${Math.round(Math.min(...day.hs.map(h=>h.t)))}–${Math.round(Math.max(...day.hs.map(h=>h.t)))}°F</b></div></div></div>
+      <div class="facts" style="margin-top:10px"><div class="fact"><small>Sunrise / Sunset</small><b>${fmtT(day.sr)} / ${fmtT(day.ss)}</b></div><div class="fact"><small>Best hour (daylight)</small><b>${fmtT(best.m)} · ${best.s}</b></div><div class="fact"><small>Legal shooting hours${lg?' ('+locState(l)+')':''}</small><b style="color:#3ecf8e">${lgTxt}</b></div><div class="fact"><small>Rut phase</small><b>${day.rut.name}${day.rut.bonus?' +'+day.rut.bonus:''}</b></div><div class="fact"><small>Prevailing wind (daylight)</small><b>${prevail(day.hs.filter(h=>h.m>=day.sr&&h.m<=day.ss))} · ${Math.round(Math.max(...day.hs.map(h=>h.w)))} mph max</b></div><div class="fact"><small>Temp range</small><b>${Math.round(Math.min(...day.hs.map(h=>h.t)))}–${Math.round(Math.max(...day.hs.map(h=>h.t)))}°F</b></div></div></div>
       <div class="card"><div class="tabs">${f15?`<button class="tab ${res==='15'?'on':''}" data-r="15">15-min</button>`:''}<button class="tab ${res==='60'?'on':''}" data-r="60">Hourly</button></div>
-      <div class="tip" id="tip">Tap or drag a chart. Orange bands are the dawn/dusk prime windows; dark is night.</div>
-      <div class="ct"><span>Favorability</span><span class="chips">${chip('Dawn',dawnA)}${chip('Dusk',duskA)}</span></div>${chart(pts,'s',{day,min:Math.floor(smin/5)*5,max:Math.ceil(smax/5)*5,bands:1,win,ticks:3,h:140})}
+      <div class="tip" id="tip">Tap or drag a chart. Orange bands are the dawn/dusk prime windows; dark is night; green dashed lines + bar mark legal shooting hours.</div>
+      <div class="ct"><span>Favorability</span><span class="chips">${chip('Dawn',dawnA)}${chip('Dusk',duskA)}</span></div>${chart(pts,'s',{day,legal:lg,min:Math.floor(smin/5)*5,max:Math.ceil(smax/5)*5,bands:1,win,ticks:3,h:140})}
       <div class="small mut" style="margin-top:2px">Best 2-hr daylight window: <b style="color:${color(win[2])}">${fmtT(win[0])}–${fmtT(win[1])} · ${Math.round(win[2])} ${label(win[2])}</b>. Scale zooms to the day; bands show the rating.</div>
-      <div class="ct"><span>Temperature °F</span><span>${Math.round(pts[0].t)}° to ${Math.round(pts[pts.length-1].t)}°</span></div>${chart(pts,'t',{day,color:'#ff9a52',span:6})}
-      <div class="ct"><span>Wind mph · dashed = gusts · letters = wind FROM</span></div>${chart(pts,'w',{day,color:'#5aa9ff',key2:'g',min:0,dirs:1,span:10,pad:0.12,nice:5,h:125})}
-      <div class="ct"><span>Cloud cover %</span></div>${chart(pts,'cc',{day,color:'#8a94a3',min:0,max:100,h:110})}
-      <div class="ct"><span>Precipitation in/${res==='15'?'15 min':'hr'}</span><span>max chance ${Math.max(...day.hs.map(h=>h.pp||0))}%</span></div>${chart(pts,'pr',{day,color:'#5aa9ff',min:0,bars:1,span:0.05,fmt:v=>v.toFixed(2)})}
-      <div class="ct"><span>Rain chance %</span><span>Open-Meteo hourly</span></div>${chart(pts,'pp',{day,color:'#5aa9ff',min:0,max:100})}
-      <div class="ct"><span>Pressure hPa (trend)</span><span>${(day.hs[day.hs.length-1].p-day.hs[0].p>0?'▲ ':'▼ ')+Math.abs(day.hs[day.hs.length-1].p-day.hs[0].p).toFixed(1)} today</span></div>${chart(pts,'p',{day,color:'#3ecf8e',span:4})}</div>
+      <div class="ct"><span>Temperature °F</span><span>${Math.round(pts[0].t)}° to ${Math.round(pts[pts.length-1].t)}°</span></div>${chart(pts,'t',{day,legal:lg,color:'#ff9a52',span:6})}
+      <div class="ct"><span>Wind mph · dashed = gusts · letters = wind FROM</span></div>${chart(pts,'w',{day,legal:lg,color:'#5aa9ff',key2:'g',min:0,dirs:1,span:10,pad:0.12,nice:5,h:125})}
+      <div class="ct"><span>Cloud cover %</span></div>${chart(pts,'cc',{day,legal:lg,color:'#8a94a3',min:0,max:100,h:110})}
+      <div class="ct"><span>Precipitation in/${res==='15'?'15 min':'hr'}</span><span>max chance ${Math.max(...day.hs.map(h=>h.pp||0))}%</span></div>${chart(pts,'pr',{day,legal:lg,color:'#5aa9ff',min:0,bars:1,span:0.05,fmt:v=>v.toFixed(2)})}
+      <div class="ct"><span>Rain chance %</span><span>Open-Meteo hourly</span></div>${chart(pts,'pp',{day,legal:lg,color:'#5aa9ff',min:0,max:100})}
+      <div class="ct"><span>Pressure hPa (trend)</span><span>${(day.hs[day.hs.length-1].p-day.hs[0].p>0?'▲ ':'▼ ')+Math.abs(day.hs[day.hs.length-1].p-day.hs[0].p).toFixed(1)} today</span></div>${chart(pts,'p',{day,legal:lg,color:'#3ecf8e',span:4})}</div>
       <div class="card"><b>Factor breakdown (prime windows)</b><div class="facts" style="margin-top:8px">${fsRow}</div>${day.rp?`<div class="msg" style="color:#5aa9ff">Precipitation includes your "raining here" report (${CFG.RAIN_REPORT[getRain(l).lvl][1].toLowerCase()} rain, ${fmtClock(getRain(l).at)}) for the current and next 2 hours.</div>`:''}</div>
-      <div class="note">Estimate only. Check regulations for legal shooting hours.</div>`;
+      <div class="note">${lg?`Legal hours: ${lg.r.rule} (<a href="${lg.r.src}" target="_blank" rel="noopener">${lg.r.srcName}</a>). ${lg.r.note||''} `:'Legal hours shown only for MN and WI locations. '}Always confirm current regulations before you shoot. Estimate only.</div>`;
     view.querySelectorAll('.tab').forEach(b => b.onclick = () => { res = b.dataset.r; draw(); });
     bindCharts(pts, $('#tip'));
   };
@@ -427,6 +438,8 @@ const howHTML = () => `<h2>How the score works</h2>
 <p><b>Rut calendar</b> (northern MN/WI): ${CFG.RUT.filter(r=>r[5]).map(r=>`${r[4]} ${r[0]}/${r[1]}–${r[2]}/${r[3]} +${r[5]}`).join(' · ')}. Based on WI collar data (peak movement Oct 23–Nov 12), WI fetal data (adult conception Nov 15–21) and MN DNR (mating Nov–early Dec).</p>
 <p>Open any day for its <b>factor breakdown</b> (points each factor added or removed in the prime windows).</p>
 <p><button class="btn ghost" id="toStudies">📚 Studies cited (${STUDIES.length})</button></p>
+<h3>Legal shooting hours (deer)</h3>
+<p><b>Minnesota:</b> ${LEGAL.MN.rule} (<a href="${LEGAL.MN.src}" target="_blank" rel="noopener">${LEGAL.MN.srcName}</a>). <b>Wisconsin:</b> ${LEGAL.WI.rule}, same for gun, archery and muzzleloader deer (<a href="${LEGAL.WI.src}" target="_blank" rel="noopener">${LEGAL.WI.srcName}</a>). ${LEGAL.WI.note} Other states: sunrise/sunset only. Uses Open-Meteo sunrise/sunset for each location. <b>Always confirm current regulations.</b></p>
 <h3>What the numbers mean</h3>
 <p>The model's raw points rarely leave about 10–85, so the shown score is <b>calibrated</b>: a fixed, one-way stretch (raw 10 → 6, 35 → 30, 50 → 50, 65 → 72, 80 → 92) so the realistic worst lands near 5 and the realistic best near 95. It never changes which hour or day ranks higher. Charts zoom to the day's range; the faint bands show the rating.</p>
 <table class="wt"><tr><th>Score</th><th>Rating</th><th>Typical conditions</th></tr>
