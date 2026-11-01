@@ -1,5 +1,5 @@
 'use strict';
-const VERSION = 'rt-v5';
+const VERSION = 'rt-v6';
 /* RDA Rack Track: whitetail movement favorability estimate. All tunables up here. */
 const CFG = {
   BASE: 50,
@@ -30,6 +30,10 @@ const CFG = {
   PRIME_DAWN: [-60, 120], PRIME_DUSK: [-150, 30],                        // minutes around sunrise / sunset
   DAY_WEIGHTS: {prime: 0.75, midday: 0.25},
   RAIN_REPORT: {light:[0.05,'Light'], steady:[0.15,'Steady'], heavy:[0.3,'Heavy']}, RAIN_REPORT_MIN: 120,
+  // Display calibration (raw model points -> 0-100 shown). Monotonic piecewise-linear, so ordering never changes.
+  // Anchored on harness scenarios: thunderstorm raw 10 -> ~6, ideal rut dawn raw ~80 -> ~92, neutral 50 -> 50.
+  CAL: [[0,0],[10,6],[25,18],[35,30],[50,50],[65,72],[80,92],[95,99],[100,100]],
+  BANDS: [[0,35,'Poor','#ff5d5d'],[35,50,'Fair','#f2b84b'],[50,65,'Good','#a6d94a'],[65,80,'Great','#3ecf8e'],[80,101,'Prime','#2ee6c8']],
   CACHE_MIN: 30, KEY_LOCS: 'rt_locs', KEY_CACHE: 'rt_wx2_'
 };
 const $ = s => document.querySelector(s), view = $('#view');
@@ -40,8 +44,10 @@ const DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'], CMP = ['N','NE','E','SE
 const compass = d => CMP[Math.round(d/45)%8];
 const C16 = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'], compass16 = d => d==null?'':C16[Math.round(((d%360)+360)%360/22.5)%16];
 const prevail = a => { let x=0,y=0; for (const h of a){ const r=h.wd*Math.PI/180, k=h.w||1; x+=Math.sin(r)*k; y+=Math.cos(r)*k; } return compass16((Math.atan2(x,y)*180/Math.PI+360)%360); };
-const color = s => s>=75?'#3ecf8e':s>=60?'#a6d94a':s>=45?'#f2b84b':s>=30?'#e8792b':'#ff5d5d';
-const label = s => s>=75?'Excellent':s>=60?'Good':s>=45?'Fair':s>=30?'Poor':'Tough';
+const bandOf = s => CFG.BANDS.find(b => s < b[1]) || CFG.BANDS[CFG.BANDS.length-1];
+const color = s => bandOf(s)[3];
+const label = s => bandOf(s)[2];
+const cal = r => { const C = CFG.CAL; r = clamp(r,0,100); for (let i=1;i<C.length;i++) if (r <= C[i][0]) { const [a,A] = C[i-1], [b,B] = C[i]; return A + (r-a)/(b-a)*(B-A); } return 100; };
 // local-time strings ("2026-10-31T14:00") -> minutes on a fake UTC clock; avoids timezone bugs
 const tm = s => { const [d,t='00:00'] = s.split('T'), [y,m,dd] = d.split('-').map(Number), [h,mi] = t.split(':').map(Number); return Date.UTC(y,m-1,dd,h,mi)/6e4; };
 const fmtClock = iso => new Date(iso).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
@@ -171,7 +177,7 @@ function scoreHour(x){
     const wet = Math.min(dry*m, cap); s = dry*(1-q) + wet*q;
   }
   f.precip = s - dry;
-  return {s: clamp(Math.round(s),0,100), f, wc: q>0.05?wc:null, q};
+  return {s: Math.round(cal(s)), raw: Math.round(s), f, wc: q>0.05?wc:null, q};
 }
 
 function model(d, nr, rep){
@@ -238,30 +244,44 @@ function fine(d, mdl, day){
   return out.length > 40 ? out : null;
 }
 
+/* best 2-hour block (avg score) within daylight sunrise-30 .. sunset+30 */
+function bestWindow(pts, day){
+  const D = pts.filter(p => p.m >= day.sr-30 && p.m <= day.ss+30); let best = null;
+  for (const p of D){ const v = D.filter(q => q.m >= p.m && q.m < p.m+120); if (!v.length || v[v.length-1].m - p.m < 60) continue;
+    const a = v.reduce((x,q)=>x+q.s,0)/v.length; if (!best || a > best[2]) best = [p.m, p.m+120, a]; }
+  return best || [D[0]?.m||pts[0].m, (D[0]?.m||pts[0].m)+120, (D[0]||pts[0]).s];
+}
 /* ---------- SVG charts ---------- */
 function chart(pts, key, opt){
-  const W = 360, H = opt.h||110, L = 30, R = 6, Tp = 8, B = 18, x0 = pts[0].m, x1 = pts[pts.length-1].m;
-  const vals = pts.map(p=>p[key]); let lo = opt.min ?? Math.min(...vals), hi = opt.max ?? Math.max(...vals);
+  const W = 360, H = opt.h||110, L = 30, R = 8, Tp = opt.dirs ? 18 : 8, B = 18, x0 = pts[0].m, x1 = pts[pts.length-1].m;
+  const vals = pts.map(p=>p[key]).concat(opt.key2 ? pts.map(p=>p[opt.key2]||0) : []); let lo = opt.min ?? Math.min(...vals), hi = opt.max ?? Math.max(...vals);
   if (hi-lo < (opt.span||1)) { const c=(hi+lo)/2; lo=c-(opt.span||1)/2; hi=c+(opt.span||1)/2; } if (opt.min!=null && lo<opt.min){ hi+=opt.min-lo; lo=opt.min; }
+  if (opt.pad && opt.max==null) hi += (hi-lo)*opt.pad; if (opt.nice) { const st = opt.nice; lo = Math.floor(lo/st)*st; hi = Math.ceil(hi/st)*st; }
   const X = m => L + (m-x0)/(x1-x0||1)*(W-L-R), Y = v => Tp + (1-(v-lo)/(hi-lo||1))*(H-Tp-B);
   let g = '';
   const {sr, ss} = opt.day;
   g += `<rect x="${L}" y="${Tp}" width="${Math.max(0,X(sr)-L)}" height="${H-Tp-B}" fill="#000" opacity=".35"/><rect x="${X(ss)}" y="${Tp}" width="${Math.max(0,W-R-X(ss))}" height="${H-Tp-B}" fill="#000" opacity=".35"/>`;
   for (const [a,b] of [[sr+CFG.PRIME_DAWN[0], sr+CFG.PRIME_DAWN[1]], [ss+CFG.PRIME_DUSK[0], ss+CFG.PRIME_DUSK[1]]])
     g += `<rect x="${X(a)}" y="${Tp}" width="${X(b)-X(a)}" height="${H-Tp-B}" fill="#e8792b" opacity=".13"/>`;
-  for (let k=0;k<=2;k++){ const v = lo+(hi-lo)*k/2; g += `<line x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}" stroke="#252c36"/><text x="${L-4}" y="${Y(v)+3}" fill="#8a94a3" font-size="9" text-anchor="end">${opt.fmt?opt.fmt(v):Math.round(v)}</text>`; }
+  if (opt.bands) for (const [a,b,nm,c] of CFG.BANDS){ const ya = Y(clamp(a,lo,hi)), yb = Y(clamp(b,lo,hi)); if (ya-yb < 1) continue;
+    g += `<rect x="${L}" y="${yb}" width="${W-L-R}" height="${ya-yb}" fill="${c}" opacity=".07"/>`; if (ya-yb >= 9) g += `<text x="${W-R-3}" y="${yb+9}" fill="${c}" font-size="8" text-anchor="end" opacity=".75">${nm}</text>`; }
+  const nt = opt.ticks || 2;
+  const tv = opt.bands ? [lo, ...CFG.BANDS.map(b=>b[0]).filter(v=>v>lo+7&&v<hi-7), hi] : Array.from({length:nt+1},(_,k)=>lo+(hi-lo)*k/nt);
+  for (const v of tv){ g += `<line x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}" stroke="#252c36"/><text x="${L-4}" y="${Y(v)+3}" fill="#8a94a3" font-size="9" text-anchor="end">${opt.fmt?opt.fmt(v):Math.round(v)}</text>`; }
   for (let h=0;h<=24;h+=6){ const m = x0 - (x0%1440) + h*60; if (m<x0||m>x1+1) continue; g += `<text x="${X(m)}" y="${H-5}" fill="#8a94a3" font-size="9" text-anchor="middle">${h===0?'12a':h===12?'12p':h<12?h+'a':(h-12)+'p'}</text>`; }
   if (opt.bars){ const bw = Math.max(1,(W-L-R)/pts.length-1); pts.forEach(p=>{ if(p[key]>0) g += `<rect x="${X(p.m)-bw/2}" y="${Y(p[key])}" width="${bw}" height="${Y(lo)-Y(p[key])}" fill="${opt.color}"/>`; }); }
   else {
     const d = pts.map((p,i)=>(i?'L':'M')+X(p.m).toFixed(1)+' '+Y(p[key]).toFixed(1)).join('');
-    if (opt.grad){ g += `<defs><linearGradient id="sg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3ecf8e"/><stop offset=".5" stop-color="#f2b84b"/><stop offset="1" stop-color="#ff5d5d"/></linearGradient></defs>`;
-      g += `<path d="${d}L${X(x1)} ${Y(lo)}L${X(x0)} ${Y(lo)}Z" fill="url(#sg)" opacity=".18"/><path d="${d}" fill="none" stroke="url(#sg)" stroke-width="2.4" stroke-linejoin="round"/>`; }
+    if (opt.bands){ g += `<path d="${d}L${X(x1)} ${Y(lo)}L${X(x0)} ${Y(lo)}Z" fill="#e6e9ee" opacity=".05"/>`;
+      for (let i=1;i<pts.length;i++){ const a = pts[i-1], b = pts[i]; g += `<line x1="${X(a.m).toFixed(1)}" y1="${Y(a[key]).toFixed(1)}" x2="${X(b.m).toFixed(1)}" y2="${Y(b[key]).toFixed(1)}" stroke="${color((a[key]+b[key])/2)}" stroke-width="2.6" stroke-linecap="round"/>`; }
+      if (opt.win){ const [a,b,v] = opt.win, xa = X(a), xb = X(b), yv = Y(v); g += `<rect x="${xa}" y="${Tp}" width="${Math.max(2,xb-xa)}" height="${H-Tp-B}" fill="none" stroke="#e6e9ee" stroke-dasharray="2 2" opacity=".6"/><line x1="${xa}" x2="${xb}" y1="${yv}" y2="${yv}" stroke="#e6e9ee" stroke-width="1.5"/>`;
+        const tx = clamp((xa+xb)/2, L+28, W-R-28), ty = yv-6 < Tp+8 ? yv+12 : yv-6; g += `<text x="${tx}" y="${ty}" fill="#e6e9ee" font-size="9" font-weight="700" text-anchor="middle" paint-order="stroke" stroke="#0d1014" stroke-width="3">Best ${fmtT(a)}–${fmtT(b)} · ${Math.round(v)}</text>`; } }
     else g += `<path d="${d}" fill="none" stroke="${opt.color}" stroke-width="2" stroke-linejoin="round"/>`;
     if (opt.key2) g += `<path d="${pts.map((p,i)=>(i?'L':'M')+X(p.m).toFixed(1)+' '+Y(p[opt.key2]).toFixed(1)).join('')}" fill="none" stroke="${opt.color}" stroke-width="1" stroke-dasharray="3 3" opacity=".7"/>`;
   }
-  if (opt.dirs){ const per = pts.length > 30 ? Math.round(pts.length/8) : 3; for (let i=Math.floor(per/2);i<pts.length;i+=per){ const p = pts[i]; g += `<text x="${X(p.m)}" y="${Tp+9}" fill="#e6e9ee" font-size="9" font-weight="600" text-anchor="middle" opacity=".85">${compass16(p.wd)}</text>`; } }
+  if (opt.dirs){ const per = pts.length > 30 ? Math.round(pts.length/8) : 3; for (let i=Math.floor(per/2);i<pts.length;i+=per){ const p = pts[i]; g += `<text x="${clamp(X(p.m),L+8,W-R-8)}" y="${Tp-6}" fill="#e6e9ee" font-size="9" font-weight="600" text-anchor="middle" opacity=".85">${compass16(p.wd)}</text>`; } }
   g += `<line class="cur" x1="0" x2="0" y1="${Tp}" y2="${H-B}" stroke="#ff9a52" stroke-width="1" opacity="0"/>`;
-  return `<svg class="chart" viewBox="0 0 ${W} ${H}" data-x0="${x0}" data-x1="${x1}" data-l="${L}" data-r="${R}" data-w="${W}">${g}</svg>`;
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" overflow="hidden" data-x0="${x0}" data-x1="${x1}" data-l="${L}" data-r="${R}" data-w="${W}">${g}</svg>`;
 }
 function bindCharts(pts, tipEl){
   const svgs = [...view.querySelectorAll('svg.chart')];
@@ -328,16 +348,22 @@ function detail(idx, k){
   const draw = () => {
     const pts = res==='15' && f15 ? f15 : day.hs, dt = new Date(Date.UTC(...day.date.split('-').map((v,i)=>i==1?v-1:+v)));
     const best = [...day.hs].filter(h=>h.m>=day.sr-60&&h.m<=day.ss+30).sort((a,b)=>b.s-a.s)[0] || day.hs[0];
+    const win = bestWindow(pts, day), pa = (a) => { const v = pts.filter(p=>p.m>=a[0]&&p.m<=a[1]); return v.length ? Math.round(v.reduce((x,p)=>x+p.s,0)/v.length) : null; };
+    const dawnA = pa([day.sr+CFG.PRIME_DAWN[0], day.sr+CFG.PRIME_DAWN[1]]), duskA = pa([day.ss+CFG.PRIME_DUSK[0], day.ss+CFG.PRIME_DUSK[1]]);
+    const sv = pts.map(p=>p.s), slo = Math.max(0, Math.min(...sv)-8), shi = Math.min(100, Math.max(...sv)+8), sp = Math.max(30, shi-slo), smid = (slo+shi)/2;
+    const smin = Math.max(0, Math.min(100-sp, smid-sp/2)), smax = smin+sp;
+    const chip = (n,v) => v==null?'':`<span>${n} <b style="color:${color(v)}">${v}</b></span>`;
     const fsRow = Object.entries(day.fs).map(([kk,v])=>`<div class="fact"><small>${{temp:'Temperature',change:'Change vs yesterday',wind:'Wind',cloud:'Sky (cloud × temp)',precip:'Rain / snow / fog',press:'Pressure / fronts',rut:'Rut phase'}[kk]}</small><b style="color:${v>0.5?'#3ecf8e':v<-0.5?'#ff5d5d':'#e6e9ee'}">${v>0?'+':''}${v.toFixed(1)} pts</b></div>`).join('');
     view.innerHTML = `<div class="card"><div class="ch"><h3>${esc(l.name)} · ${DOW[dt.getUTCDay()]} ${dt.getUTCMonth()+1}/${dt.getUTCDate()}</h3><div class="sc" style="background:${color(day.score)}">${day.score}</div></div>
       <div class="why"><b>${label(day.score)}</b> · ${esc(day.reason)}</div>
       <div class="facts" style="margin-top:10px"><div class="fact"><small>Sunrise / Sunset</small><b>${fmtT(day.sr)} / ${fmtT(day.ss)}</b></div><div class="fact"><small>Best hour (daylight)</small><b>${fmtT(best.m)} · ${best.s}</b></div><div class="fact"><small>Rut phase</small><b>${day.rut.name}${day.rut.bonus?' +'+day.rut.bonus:''}</b></div><div class="fact"><small>Prevailing wind (daylight)</small><b>${prevail(day.hs.filter(h=>h.m>=day.sr&&h.m<=day.ss))} · ${Math.round(Math.max(...day.hs.map(h=>h.w)))} mph max</b></div><div class="fact"><small>Temp range</small><b>${Math.round(Math.min(...day.hs.map(h=>h.t)))}–${Math.round(Math.max(...day.hs.map(h=>h.t)))}°F</b></div></div></div>
       <div class="card"><div class="tabs">${f15?`<button class="tab ${res==='15'?'on':''}" data-r="15">15-min</button>`:''}<button class="tab ${res==='60'?'on':''}" data-r="60">Hourly</button></div>
       <div class="tip" id="tip">Tap or drag a chart. Orange bands are the dawn/dusk prime windows; dark is night.</div>
-      <div class="ct"><span>Favorability</span><span>0–100</span></div>${chart(pts,'s',{day,min:0,max:100,grad:1,h:130})}
+      <div class="ct"><span>Favorability</span><span class="chips">${chip('Dawn',dawnA)}${chip('Dusk',duskA)}</span></div>${chart(pts,'s',{day,min:Math.floor(smin/5)*5,max:Math.ceil(smax/5)*5,bands:1,win,ticks:3,h:140})}
+      <div class="small mut" style="margin-top:2px">Best 2-hr daylight window: <b style="color:${color(win[2])}">${fmtT(win[0])}–${fmtT(win[1])} · ${Math.round(win[2])} ${label(win[2])}</b>. Scale zooms to the day; bands show the rating.</div>
       <div class="ct"><span>Temperature °F</span><span>${Math.round(pts[0].t)}° to ${Math.round(pts[pts.length-1].t)}°</span></div>${chart(pts,'t',{day,color:'#ff9a52',span:6})}
-      <div class="ct"><span>Wind mph (dashed = gusts), letters = direction wind is FROM</span></div>${chart(pts,'w',{day,color:'#5aa9ff',key2:'g',min:0,dirs:1,span:10})}
-      <div class="ct"><span>Cloud cover %</span></div>${chart(pts,'cc',{day,color:'#8a94a3',min:0,max:100})}
+      <div class="ct"><span>Wind mph · dashed = gusts · letters = wind FROM</span></div>${chart(pts,'w',{day,color:'#5aa9ff',key2:'g',min:0,dirs:1,span:10,pad:0.12,nice:5,h:125})}
+      <div class="ct"><span>Cloud cover %</span></div>${chart(pts,'cc',{day,color:'#8a94a3',min:0,max:100,h:110})}
       <div class="ct"><span>Precipitation in/${res==='15'?'15 min':'hr'}</span><span>max chance ${Math.max(...day.hs.map(h=>h.pp||0))}%</span></div>${chart(pts,'pr',{day,color:'#5aa9ff',min:0,bars:1,span:0.05,fmt:v=>v.toFixed(2)})}
       <div class="ct"><span>Rain chance %</span><span>Open-Meteo hourly</span></div>${chart(pts,'pp',{day,color:'#5aa9ff',min:0,max:100})}
       <div class="ct"><span>Pressure hPa (trend)</span><span>${(day.hs[day.hs.length-1].p-day.hs[0].p>0?'▲ ':'▼ ')+Math.abs(day.hs[day.hs.length-1].p-day.hs[0].p).toFixed(1)} today</span></div>${chart(pts,'p',{day,color:'#3ecf8e',span:4})}</div>
@@ -401,7 +427,15 @@ const howHTML = () => `<h2>How the score works</h2>
 <p><b>Rut calendar</b> (northern MN/WI): ${CFG.RUT.filter(r=>r[5]).map(r=>`${r[4]} ${r[0]}/${r[1]}–${r[2]}/${r[3]} +${r[5]}`).join(' · ')}. Based on WI collar data (peak movement Oct 23–Nov 12), WI fetal data (adult conception Nov 15–21) and MN DNR (mating Nov–early Dec).</p>
 <p>Open any day for its <b>factor breakdown</b> (points each factor added or removed in the prime windows).</p>
 <p><button class="btn ghost" id="toStudies">📚 Studies cited (${STUDIES.length})</button></p>
-<p>Colors: <span style="color:#3ecf8e">75+ excellent</span> · <span style="color:#a6d94a">60 good</span> · <span style="color:#f2b84b">45 fair</span> · <span style="color:#e8792b">30 poor</span> · <span style="color:#ff5d5d">under 30 tough</span>. This is an estimate, not a validated model.</p><p class="ver">Version ${VERSION}</p>`;
+<h3>What the numbers mean</h3>
+<p>The model's raw points rarely leave about 10–85, so the shown score is <b>calibrated</b>: a fixed, one-way stretch (raw 10 → 6, 35 → 30, 50 → 50, 65 → 72, 80 → 92) so the realistic worst lands near 5 and the realistic best near 95. It never changes which hour or day ranks higher. Charts zoom to the day's range; the faint bands show the rating.</p>
+<table class="wt"><tr><th>Score</th><th>Rating</th><th>Typical conditions</th></tr>
+<tr><td style="color:${CFG.BANDS[4][3]}">80+</td><td>Prime</td><td>Rut, cold clear or cooling dawn/dusk, light–moderate wind, dry</td></tr>
+<tr><td style="color:${CFG.BANDS[3][3]}">65–79</td><td>Great</td><td>Rut or cool dry weather, overcast fine</td></tr>
+<tr><td style="color:${CFG.BANDS[2][3]}">50–64</td><td>Good</td><td>Average fall day, mild temps, or rut with a downside</td></tr>
+<tr><td style="color:${CFG.BANDS[1][3]}">35–49</td><td>Fair</td><td>Warm, rain likely, or light rain with wind</td></tr>
+<tr><td style="color:${CFG.BANDS[0][3]}">under 35</td><td>Poor</td><td>Raining, storms, heat, or very high wind</td></tr></table>
+<p class="small">Rain caps above are in raw points; shown as calibrated they're about: ${Object.values(CFG.WET).map(([m,c,l])=>`${l} ${Math.round(cal(c))}`).join(' · ')}. Factor breakdown is in raw model points. This is an estimate, not a validated model.</p><p class="ver">Version ${VERSION}</p>`;
 const studiesHTML = () => `<h2>Studies cited</h2><p>Sources behind the weights. "Read" says how much of each we actually read. Weak or conflicting evidence is flagged in <a href="#" id="toHow">How the score works</a>.</p>
 ${STUDIES.map(s=>`<div class="study"><b><a href="${s.u}" target="_blank" rel="noopener">${esc(s.t)}</a></b><br><small>${esc(s.a)} · ${s.y} · informs: <b>${s.f}</b></small><div>${esc(s.x)}</div><small class="mut">Read: ${s.r}</small></div>`).join('')}
 <p class="small">Not used: solunar / moon tables, "deer movement index" apps (no published validation found).</p><p class="ver">Version ${VERSION}</p>`;
