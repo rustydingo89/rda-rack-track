@@ -29,7 +29,7 @@ const CFG = {
     [12,21,12,31,'Late season',0,'Food is king. Cold snaps push daylight feeding.']],
   PRIME_DAWN: [-60, 120], PRIME_DUSK: [-150, 30],                        // minutes around sunrise / sunset
   DAY_WEIGHTS: {prime: 0.75, midday: 0.25},
-  RAIN_REPORT: {light:[0.05,'Light'], steady:[0.15,'Steady'], heavy:[0.3,'Heavy']}, RAIN_REPORT_MIN: 120,
+  RAIN_REPORT: {dry:[0,'Not raining'], light:[0.05,'Light'], steady:[0.15,'Steady'], heavy:[0.3,'Heavy']}, RAIN_REPORT_MIN: 120,
   // Display calibration (raw model points -> 0-100 shown). Monotonic piecewise-linear, so ordering never changes.
   // Anchored on harness scenarios: thunderstorm raw 10 -> ~6, ideal rut dawn raw ~80 -> ~92, neutral 50 -> 50.
   CAL: [[0,0],[10,6],[25,18],[35,30],[50,50],[65,72],[80,92],[95,99],[100,100]],
@@ -189,14 +189,14 @@ function model(d, nr, rep){
     const p = H.pressure_msl, f = {}, live = curH && H.time[i]===curH;
     let t = H.temperature_2m[i], w = H.wind_speed_10m[i], wd = H.wind_direction_10m[i], pr = effPr(H.precipitation[i], H.weather_code&&H.weather_code[i], H.precipitation_probability[i]), pp = H.precipitation_probability[i];
     if (live) { if (nr.t!=null) t = nr.t; if (nr.w!=null) w = nr.w; if (nr.wd!=null) wd = nr.wd; pr = Math.max(pr, nr.rate); pp = Math.max(pp||0, nr.pp2||0, nr.wet?100:0); }
-    const rp = rep && T[i] >= Math.min(repStart,nowM) && T[i] <= repEnd; if (rp) { pr = Math.max(pr, CFG.RAIN_REPORT[rep.lvl][0]); pp = 100; }
+    const rp = rep && T[i] >= Math.min(repStart,nowM) && T[i] <= repEnd; const dryRep = rp && rep.lvl==='dry'; if (dryRep) { pr = 0; pp = 0; } else if (rp) { pr = Math.max(pr, CFG.RAIN_REPORT[rep.lvl][0]); pp = 100; }
     const t24 = i>=24 ? H.temperature_2m[i-24] : null, d3 = i>=3 ? p[i]-p[i-3] : 0, d12 = i>=15 ? p[i-3]-p[i-15] : 0;
     let code = H.weather_code ? H.weather_code[i] : null, cc = H.cloud_cover[i];
     if (live && nr.code!=null) code = nr.wet ? Math.max(code||0, nr.code) : nr.code; if (live && nr.cc!=null) cc = nr.cc;
-    if (rp && !(code>=51)) code = null;
+    if (dryRep && code>=51) code = 3; else if (rp && !(code>=51)) code = null;
     const day = H.time[i].slice(0,10), dl = d.daily.time.indexOf(day), srm = dl>=0?tm(d.daily.sunrise[dl]):0, ssm = dl>=0?tm(d.daily.sunset[dl]):0;
     const prime = dl>=0 && ((T[i] >= srm+CFG.PRIME_DAWN[0] && T[i] <= srm+CFG.PRIME_DAWN[1]) || (T[i] >= ssm+CFG.PRIME_DUSK[0] && T[i] <= ssm+CFG.PRIME_DUSK[1]));
-    const r = scoreHour({t, t24, w, g:H.wind_gusts_10m[i], cc, pr, pp, code, d3, d12, p:p[i], time:H.time[i], prime, sure: rp || (live && nr.wet)});
+    const r = scoreHour({t, t24, w, g:H.wind_gusts_10m[i], cc, pr, pp, code, d3, d12, p:p[i], time:H.time[i], prime, sure: !dryRep && (rp || (live && nr.wet))});
     const s = r.s; Object.assign(f, r.f);
     hours.push({i, m:T[i], time:H.time[i], s, f, t, t24, w, g:H.wind_gusts_10m[i], wd, cc, pr, pp:pp||0, p:p[i], dp:d3, d12, code, prime, live, rp, wc:r.wc, q:r.q});
   }
@@ -340,7 +340,7 @@ async function renderCard(l, idx, n, el){
   try {
     const [c, nc] = await Promise.all([weather(l), nowcast(l).catch(()=>null), ensureState(l, idx)]), nr = nc ? nowRead(nc) : null, rep = getRain(l), mdl = model(c.d, nr, rep); state.data[idx] = c.d; state.models[idx] = mdl;
     const lh = mdl.hours.find(h=>h.live);
-    const strip = nr ? `<div class="now"><div class="nowt"><b>Right now</b>${lh?` <span class="sc sm" style="background:${color(lh.s)}">${lh.s}</span>`:''}</div><div class="nowv">${nr.t!=null?Math.round(nr.t)+'°F':''} · ${nr.w!=null?Math.round(nr.w)+' mph '+(nr.wd!=null?compass16(nr.wd):''):''} · ${esc(nr.sky)} · <b style="color:${nr.wet||rep?'#5aa9ff':'inherit'}">${rep?'Rain (you)':nr.wet?'Wet '+nr.rate.toFixed(2)+'"/hr':'Dry'}</b>${lh&&lh.f.precip<-0.5?` (${Math.round(lh.f.precip)} pts)`:''}</div><small>Next hour: <b>${nr.firstWet?(nr.firstWet.in<=0?'raining now':'rain in ~'+nr.firstWet.in+' min')+' ('+nr.firstWet.rate.toFixed(2)+'"/hr, Open-Meteo 15-min)':'no rain in Open-Meteo 15-min nowcast'}</b> · next 2 hr max ${nr.next2>0.004?nr.next2.toFixed(2)+'"/hr':'dry'}${nr.h0?' · NWS '+nr.pp2+'% · '+esc(nr.h0.txt):''}<br>📍 ${esc(l.name)} · ${nr.ob?`NWS ${nr.ob.id}${nr.ob.mi!=null?' ('+Math.round(nr.ob.mi)+' mi away)':''} obs ${fmtClock(nr.ob.ts)}`:'No nearby NWS obs'}${nr.omTime?` · Open-Meteo ${fmtT(tm(nr.omTime))}`:''}${nc.stale?' · offline':''}</small>${rainUI(rep)}</div>` : rainUI(rep);
+    const strip = nr ? `<div class="now"><div class="nowt"><b>Right now</b>${lh?` <span class="sc sm" style="background:${color(lh.s)}">${lh.s}</span>`:''}</div><div class="nowv">${nr.t!=null?Math.round(nr.t)+'°F':''} · ${nr.w!=null?Math.round(nr.w)+' mph '+(nr.wd!=null?compass16(nr.wd):''):''} · ${esc(nr.sky)} · <b style="color:${rep&&rep.lvl==='dry'?'#3ecf8e':nr.wet||rep?'#5aa9ff':'inherit'}">${rep?(rep.lvl==='dry'?'Dry (you)':'Rain (you)'):nr.wet?'Wet '+nr.rate.toFixed(2)+'"/hr':'Dry'}</b>${lh&&lh.f.precip<-0.5?` (${Math.round(lh.f.precip)} pts)`:''}</div><small>Next hour: <b>${nr.firstWet?(nr.firstWet.in<=0?'raining now':'rain in ~'+nr.firstWet.in+' min')+' ('+nr.firstWet.rate.toFixed(2)+'"/hr, Open-Meteo 15-min)':'no rain in Open-Meteo 15-min nowcast'}</b> · next 2 hr max ${nr.next2>0.004?nr.next2.toFixed(2)+'"/hr':'dry'}${nr.h0?' · NWS '+nr.pp2+'% · '+esc(nr.h0.txt):''}<br>📍 ${esc(l.name)} · ${nr.ob?`NWS ${nr.ob.id}${nr.ob.mi!=null?' ('+Math.round(nr.ob.mi)+' mi away)':''} obs ${fmtClock(nr.ob.ts)}`:'No nearby NWS obs'}${nr.omTime?` · Open-Meteo ${fmtT(tm(nr.omTime))}`:''}${nc.stale?' · offline':''}</small>${rainUI(rep)}</div>` : rainUI(rep);
     el.innerHTML = head + strip + (c.stale?'<div class="msg">Offline: showing last saved forecast.</div>':'') + '<div class="days">' + mdl.days.map((d,k) => { const dt = new Date(Date.UTC(...d.date.split('-').map((v,i)=>i==1?v-1:+v)));
       return `<button class="day" data-k="${k}"><div class="dn"><b>${k===0?'Today':DOW[dt.getUTCDay()]}</b><small>${dt.getUTCMonth()+1}/${dt.getUTCDate()}</small></div><div class="sc" style="background:${color(d.score)}">${d.score}</div><div class="why"><b>${label(d.score)}</b> · ${d.rut.name}<br>${esc(d.reason)}<br><small class="mut">☀ ${fmtT(d.sr)}–${fmtT(d.ss)}${(lg=>lg?` · <span style="color:#3ecf8e">Legal ${fmtT(lg.a)}–${fmtT(lg.b)}</span>`:'')(legalFor(l,d))}</small></div></button>`; }).join('') + '</div>';
     bind(); el.querySelectorAll('[data-rain]').forEach(b => b.onclick = () => { setRain(l, b.dataset.rain); delete state.data[idx]; renderCard(l, idx, n, el); });
@@ -348,10 +348,11 @@ async function renderCard(l, idx, n, el){
   } catch (e) { el.innerHTML = head + `<div class="msg">Forecast unavailable (${esc(e.message)}). Check your connection.</div>`; bind(); }
 }
 function rainUI(rep){
-  const lv = Object.entries(CFG.RAIN_REPORT);
-  if (rep) return `<div class="rain on">🌧 <b>You reported ${CFG.RAIN_REPORT[rep.lvl][1].toLowerCase()} rain at ${fmtClock(rep.at)}</b> <small>(applies through ${fmtClock(rep.exp)})</small><div class="rbtns">${lv.map(([k,v])=>`<button class="rb ${k===rep.lvl?'on':''}" data-rain="${k}">${v[1]}</button>`).join('')}<button class="rb clr" data-rain="">☀ Not raining</button></div></div>`;
-  return `<div class="rain"><span>Raining where you are?</span><div class="rbtns"><button class="rb main" data-rain="light">🌧 Raining here</button>${lv.slice(1).map(([k,v])=>`<button class="rb" data-rain="${k}">${v[1]}</button>`).join('')}</div></div>`;
+  const cur = rep ? rep.lvl : '', opts = [['','Auto'],['dry','☀ Dry'],['light','Light'],['steady','Steady'],['heavy','Heavy']];
+  const msg = rep ? `<b>You set: ${rep.lvl==='dry'?'not raining':CFG.RAIN_REPORT[rep.lvl][1].toLowerCase()+' rain'}</b> at ${fmtClock(rep.at)} <small>(overrides forecast/station until ${fmtClock(rep.exp)})</small>` : `<span>Raining where you are? Tap to override the forecast for ~2 hr.</span>`;
+  return `<div class="rain ${rep?'on':''}">${msg}<div class="seg" role="radiogroup">${opts.map(([k,v])=>`<button class="sg ${k===cur?'on':''} ${k==='dry'?'dry':''}" role="radio" aria-checked="${k===cur}" data-rain="${k}">${v}</button>`).join('')}</div></div>`;
 }
+
 function detail(idx, k){
   const l = getLocs()[idx], d = state.data[idx], mdl = state.models[idx], day = mdl.days[k]; if (!day) return home();
   location.hash = 'd'; $('#back').hidden = false; window.scrollTo(0,0);
@@ -378,7 +379,7 @@ function detail(idx, k){
       <div class="ct"><span>Precipitation in/${res==='15'?'15 min':'hr'}</span><span>max chance ${Math.max(...day.hs.map(h=>h.pp||0))}%</span></div>${chart(pts,'pr',{day,legal:lg,color:'#5aa9ff',min:0,bars:1,span:0.05,fmt:v=>v.toFixed(2)})}
       <div class="ct"><span>Rain chance %</span><span>Open-Meteo hourly</span></div>${chart(pts,'pp',{day,legal:lg,color:'#5aa9ff',min:0,max:100})}
       <div class="ct"><span>Pressure hPa (trend)</span><span>${(day.hs[day.hs.length-1].p-day.hs[0].p>0?'▲ ':'▼ ')+Math.abs(day.hs[day.hs.length-1].p-day.hs[0].p).toFixed(1)} today</span></div>${chart(pts,'p',{day,legal:lg,color:'#3ecf8e',span:4})}</div>
-      <div class="card"><b>Factor breakdown (prime windows)</b><div class="facts" style="margin-top:8px">${fsRow}</div>${day.rp?`<div class="msg" style="color:#5aa9ff">Precipitation includes your "raining here" report (${CFG.RAIN_REPORT[getRain(l).lvl][1].toLowerCase()} rain, ${fmtClock(getRain(l).at)}) for the current and next 2 hours.</div>`:''}</div>
+      <div class="card"><b>Factor breakdown (prime windows)</b><div class="facts" style="margin-top:8px">${fsRow}</div>${day.rp?`<div class="msg" style="color:#5aa9ff">Precipitation includes your report (${getRain(l).lvl==='dry'?'not raining':CFG.RAIN_REPORT[getRain(l).lvl][1].toLowerCase()+' rain'}, ${fmtClock(getRain(l).at)}) for the current and next 2 hours.</div>`:''}</div>
       <div class="note">${lg?`Legal hours: ${lg.r.rule} (<a href="${lg.r.src}" target="_blank" rel="noopener">${lg.r.srcName}</a>). ${lg.r.note||''} `:'Legal hours shown only for MN and WI locations. '}Always confirm current regulations before you shoot. Estimate only.</div>`;
     view.querySelectorAll('.tab').forEach(b => b.onclick = () => { res = b.dataset.r; draw(); });
     bindCharts(pts, $('#tip'));
@@ -434,7 +435,7 @@ const howHTML = () => `<h2>How the score works</h2>
 <h3>Weight vs. evidence</h3>
 <table class="wt"><tr><th>Factor</th><th>Range</th><th>Evidence</th></tr>${EVID.map(e=>`<tr><td><b>${e[0]}</b><br><small>${e[3]}</small></td><td>${e[1]}</td><td>${e[2]}</td></tr>`).join('')}</table>
 <p><b>Overcast, honestly:</b> no study we found measured cloud cover by itself. Overcast with no rain is not treated as bad; it's near neutral when cool. A dark, rainy day scores low because of the rain, not the clouds.</p>
-<p><b>Right now:</b> nearest NWS station observation, Open-Meteo current and its 15-minute nowcast (used for "rain in ~X min"), and the NWS hourly forecast. Refreshed every ${CFG.NOW_CACHE_MIN} min. Tap <b>Raining here</b> if you're in rain the data misses (counts for this hour + 2).</p>
+<p><b>Right now:</b> nearest NWS station observation, Open-Meteo current and its 15-minute nowcast (used for "rain in ~X min"), and the NWS hourly forecast. Refreshed every ${CFG.NOW_CACHE_MIN} min. Use the <b>Auto / Dry / Light / Steady / Heavy</b> switch if the data is wrong where you are: it overrides this hour + 2 and expires after 2 hr; Dry forces a dry reading even if the forecast or station says wet.</p>
 <p><b>Rut calendar</b> (northern MN/WI): ${CFG.RUT.filter(r=>r[5]).map(r=>`${r[4]} ${r[0]}/${r[1]}–${r[2]}/${r[3]} +${r[5]}`).join(' · ')}. Based on WI collar data (peak movement Oct 23–Nov 12), WI fetal data (adult conception Nov 15–21) and MN DNR (mating Nov–early Dec).</p>
 <p>Open any day for its <b>factor breakdown</b> (points each factor added or removed in the prime windows).</p>
 <p><button class="btn ghost" id="toStudies">📚 Studies cited (${STUDIES.length})</button></p>
