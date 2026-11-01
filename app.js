@@ -1,5 +1,5 @@
 'use strict';
-const VERSION = 'rt-v7';
+const VERSION = 'rt-v8';
 /* RDA Rack Track: whitetail movement favorability estimate. All tunables up here. */
 const CFG = {
   BASE: 50,
@@ -273,7 +273,7 @@ async function ensureState(l, idx){ if (locState(l)) { const s0 = locState(l); i
 function migrateLocs(){ const L = getLocs(); let ch = 0; L.forEach(l => { const s0 = locState(l) || bboxState(l.lat, l.lon); if (s0 && l.st !== s0) { l.st = s0; ch = 1; } }); if (ch) setLocs(L); }
 try { migrateLocs(); } catch {}
 const legalFor = (l, day) => { const k = locState(l), r = LEGAL[k||'MN']; return {a: day.sr - r.pre, b: day.ss + r.post, r, st:k||'MN', guess:!k}; };
-const legalLine = (l, d, big) => { const lg = legalFor(l, d); return `<div class="legal${big?' big':''}"><span class="pill">🎯 Legal shooting time: ${fmtT(lg.a)} – ${fmtT(lg.b)}</span><small class="rule">${lg.st}${lg.guess?' rule (state unknown)':''}: ${lg.r.rule}</small></div><div class="sun">☀ Sunrise ${fmtT(d.sr)} · Sunset ${fmtT(d.ss)}</div>`; };
+const legalLine = (l, d, big) => { const lg = legalFor(l, d); return `<div class="sun">☀ Sunrise ${fmtT(d.sr)} · Sunset ${fmtT(d.ss)}</div><div class="legal${big?' big':''}"><small class="rule">${lg.st}${lg.guess?' rule (state unknown)':''}: ${lg.r.rule}</small><div class="lt">Legal shooting time: ${fmtT(lg.a)} – ${fmtT(lg.b)}</div></div>`; };
 const stPicker = l => locState(l) ? '' : `<div class="legal pick">State not detected — using MN rule. Set state: <button class="sg" data-st="MN">MN</button><button class="sg" data-st="WI">WI</button></div>`;
 /* ---------- SVG charts ---------- */
 function chart(pts, key, opt){
