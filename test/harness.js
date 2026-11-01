@@ -10,7 +10,7 @@ function load(file){
 }
 module.exports={load};
 if(require.main===module){
-  const A=load(__dirname+'/../app.js'), B=require('fs').existsSync('/tmp/app-v5.js')?load('/tmp/app-v5.js'):null;
+  const A=load(__dirname+'/../app.js'), B=require('fs').existsSync(__dirname+'/app-v8.js')?load(__dirname+'/app-v8.js'):null;
   const base={t24:null,d3:0,d12:0,p:1015,time:'2026-11-05T07:00',prime:true};
   const S=[['Ideal rut dawn (cold, cooling, clear, 10 mph, falling baro)',{t:28,t24:40,w:10,g:16,cc:5,pr:0,pp:0,code:0,d3:-2}],['Clear cold calm dawn',{t:22,t24:30,w:3,g:6,cc:5,pr:0,pp:0,code:0}],
    ['Light rain',{t:42,w:6,g:12,cc:100,pr:0.03,pp:90,code:61,sure:true}],
@@ -19,8 +19,8 @@ if(require.main===module){
    ['100% overcast, dry',{t:38,w:6,g:12,cc:100,pr:0,pp:5,code:3}],
    ['Mild cloudy, early season',{t:55,w:8,g:14,cc:70,pr:0,pp:10,code:2,time:'2026-10-05T07:00'}],
    ['Hot, sunny, windy',{t:78,w:24,g:40,cc:5,pr:0,pp:0,code:0,prime:false,time:'2026-11-05T13:00'}]];
-  console.log('| Scenario | v5 | v6 shown (raw) |\n|---|---|---|');
-  for(const [n,x] of S){const r=A.scoreHour({...base,...x}),o=B?B.scoreHour({...base,...x}).s:'-';console.log(`| ${n} | ${o} | **${r.s}** (${r.raw}) |`)}
+  console.log('| Scenario | v8 shown (raw) | v9 shown (raw) |\n|---|---|---|');
+  for(const [n,x] of S){const r=A.scoreHour({...base,...x}),o=B?(q=>q.s+" ("+q.raw+")")(B.scoreHour({...base,...x})):'-';console.log(`| ${n} | ${o} | **${r.s}** (${r.raw}) |`)}
   console.log('');
   console.log('| Scenario | Score | temp | wind | sky | rut | rain adj |\n|---|---|---|---|---|---|---|');
   for(const [n,x] of S){const r=A.scoreHour({...base,...x});console.log(`| ${n} | **${r.s}** | ${r.f.temp.toFixed(1)} | ${r.f.wind.toFixed(1)} | ${r.f.cloud.toFixed(1)} | ${r.f.rut} | ${r.f.precip.toFixed(1)} |`)}

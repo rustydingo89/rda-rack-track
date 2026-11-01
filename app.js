@@ -1,5 +1,5 @@
 'use strict';
-const VERSION = 'rt-v8';
+const VERSION = 'rt-v9';
 /* RDA Rack Track: whitetail movement favorability estimate. All tunables up here. */
 const CFG = {
   BASE: 50,
@@ -9,7 +9,7 @@ const CFG = {
   WIND: [[1,-3],[5,1],[16,4],[27,3],[35,-4],[999,-10]],                  // PSU: bucks moved MORE with wind; others mixed
   GUST: [[35,0],[45,-4],[999,-8]],
   SKY: {clearCool:5, clearWarm:-6, partly:3, overcastCool:1, overcastWarm:-1, warmF:60, coolF:50}, // weakly supported
-  PRESS_FALL_3H: -1.5, PRESS_FALL_PTS: 2, POST_FRONT_FALL_12H: -3, POST_FRONT_RISE_3H: 1, POST_FRONT_PTS: 3, PRESS_HIGH: 1022, PRESS_HIGH_PTS: 1, // not supported by GPS studies: kept small
+  PRESS_FALL_3H: -1.5, PRESS_FALL_PTS: 0, POST_FRONT_FALL_12H: -3, POST_FRONT_RISE_3H: 1, POST_FRONT_PTS: 3, PRESS_HIGH: 1022, PRESS_HIGH_PTS: 1, // v9: falling-baro bonus removed (Auburn GPS: activity usually lower while pressure falls fast, higher as it rises); post-front rise kept small
   PRIME_DAMP: 0.75,   // Auburn: weather mattered least at dawn/dusk, so non-rain weather terms are damped in prime windows
   // Wet weather multiplies the dry score, then caps it (rut bonus can't lift it past the cap).
   // PSU collars: bucks travelled ~40% less on rainy October days (0.8 -> 0.5 mi); does unaffected.
@@ -18,14 +18,15 @@ const CFG = {
     storm:[0.35,10,'Thunderstorm'], snowLight:[0.95,75,'Light snow'], snow:[0.80,50,'Snow'], snowHeavy:[0.55,25,'Heavy snow']},
   WINDY_RAIN_MPH: 16, WINDY_RAIN_RELIEF: [0.15, 10], // PSU: light rain + strong wind didn't cut buck movement
   NOW_CACHE_MIN: 5, OBS_MAX_AGE_MIN: 90,
-  RUT: [ // northern MN/WI calendar approximation [startMonth, startDay, endMonth, endDay, name, bonus, blurb]
-    [1,1,10,19,'Early season',0,'Bed-to-feed patterns rule. Hunt food sources at last light.'],
-    [10,20,10,31,'Pre-rut / seeking',8,'Scrapes and rubs are opening up and bucks are cruising more in daylight.'],
-    [11,1,11,10,'Seeking / chasing',10,'Bucks are on their feet checking does. All-day sits pay off.'],
-    [11,11,11,24,'Peak breeding',7,'Bucks are locked down with does but still move a lot. Cover funnels and doe bedding.'],
+  RUT: [ // northern MN/WI calendar [startMonth, startDay, endMonth, endDay, name, bonus, blurb]. v9: anchored on WI DNR 188-buck GPS study (peak movement Oct 23-Nov 12)
+    [1,1,10,14,'Early season',0,'Bed-to-feed patterns rule. Hunt food sources at last light.'],
+    [10,15,10,22,'Pre-rut',4,'Scrapes and rubs are opening up. Daylight buck movement starting to climb.'],
+    [10,23,10,31,'Seeking',8,'WI collar data: buck movement peak begins about Oct 23. Bucks cruising more in daylight.'],
+    [11,1,11,12,'Seeking / chasing',10,'Inside the WI-measured peak (Oct 23-Nov 12). Bucks on their feet checking does. All-day sits pay off.'],
+    [11,13,11,24,'Peak breeding',6,'Adult does mostly bred Nov 15-21 (central WI). Bucks locked down with does but still move. Cover funnels and doe bedding.'],
     [11,25,11,30,'Post-rut',3,'Tired bucks go back to food. Late lockdown tail.'],
     [12,1,12,4,'Late season',0,'Food is king. Cold snaps push daylight feeding.'],
-    [12,5,12,20,'Second rut',4,'Unbred does and fawns come into heat. A small secondary bump.'],
+    [12,5,12,20,'Second rut',4,'Unbred does and doe fawns cycle again about a month later. A small secondary bump.'],
     [12,21,12,31,'Late season',0,'Food is king. Cold snaps push daylight feeding.']],
   PRIME_DAWN: [-60, 120], PRIME_DUSK: [-150, 30],                        // minutes around sunrise / sunset
   DAY_WEIGHTS: {prime: 0.75, midday: 0.25},
@@ -34,7 +35,7 @@ const CFG = {
   // Anchored on harness scenarios: thunderstorm raw 10 -> ~6, ideal rut dawn raw ~80 -> ~92, neutral 50 -> 50.
   CAL: [[0,0],[10,6],[25,18],[35,30],[50,50],[65,72],[80,92],[95,99],[100,100]],
   BANDS: [[0,35,'Poor','#ff5d5d'],[35,50,'Fair','#f2b84b'],[50,65,'Good','#a6d94a'],[65,80,'Great','#3ecf8e'],[80,101,'Prime','#2ee6c8']],
-  CACHE_MIN: 30, KEY_LOCS: 'rt_locs', KEY_CACHE: 'rt_wx2_'
+  CACHE_MIN: 30, KEY_LOCS: 'rt_locs', KEY_CACHE: 'rt_wx3_', BLEND_MODELS: 'ecmwf_ifs025,gem_seamless', AGREE: [[4,0.15,'High'],[8,0.5,'Medium'],[999,999,'Low']]
 };
 const $ = s => document.querySelector(s), view = $('#view');
 const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
@@ -88,10 +89,28 @@ async function weather(loc, force){
   try {
     const u = `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}&hourly=${HV}&minutely_15=${MV}&daily=sunrise,sunset&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&past_days=1&forecast_days=7`;
     const r = await fetch(u); if (!r.ok) throw new Error('HTTP '+r.status);
-    c = {t:Date.now(), d:await r.json()}; localStorage.setItem(key, JSON.stringify(c)); return c;
+    const d = await r.json();
+    // Multi-model blend: median of Open-Meteo best match (GFS/HRRR in US) + ECMWF + GEM. If the extra call fails, single model is used.
+    try { const r2 = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}&hourly=${HV}&models=${CFG.BLEND_MODELS}&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&past_days=1&forecast_days=7`);
+      if (r2.ok) blend(d, await r2.json()); } catch {}
+    c = {t:Date.now(), d}; localStorage.setItem(key, JSON.stringify(c)); return c;
   } catch (e) { if (c) { c.stale = true; return c; } throw e; }
 }
 
+const med = a => { a = a.filter(v=>v!=null).sort((x,y)=>x-y); const n = a.length; return !n ? null : n%2 ? a[(n-1)/2] : (a[n/2-1]+a[n/2])/2; };
+function blend(d, x){
+  const H = d.hourly, X = x.hourly, ms = CFG.BLEND_MODELS.split(','); if (!X || X.time[0]!==H.time[0]) return;
+  const ok = ms.filter(m => (X['temperature_2m_'+m]||[]).some(v=>v!=null)); if (!ok.length) return;
+  const sp = {}; // per-day spread: mean hourly temp range (°F) and range of model precip totals (in)
+  for (const v of ['temperature_2m','wind_speed_10m','wind_gusts_10m','cloud_cover','precipitation','pressure_msl','precipitation_probability'])
+    H[v] = H[v].map((b,i) => { const all = [b, ...ok.map(m => (X[v+'_'+m]||[])[i])];
+      if (v==='temperature_2m') { const a = all.filter(z=>z!=null), day = H.time[i].slice(0,10); (sp[day] = sp[day] || {t:[], p:all.map(()=>0)}).t.push(Math.max(...a)-Math.min(...a)); }
+      if (v==='precipitation') { const day = H.time[i].slice(0,10); if (sp[day]) all.forEach((z,j)=>sp[day].p[j]+=z||0); }
+      return v==='precipitation_probability' ? (a => a.length ? Math.round(a.reduce((p,q)=>p+q,0)/a.length) : b)(all.filter(z=>z!=null)) : med(all); });
+  const ag = {}; for (const [day,o] of Object.entries(sp)) { const t = o.t.reduce((a,b)=>a+b,0)/o.t.length, p = Math.max(...o.p)-Math.min(...o.p);
+    ag[day] = {t:+t.toFixed(1), p:+p.toFixed(2), lvl: CFG.AGREE.find(a => t < a[0] && p < a[1])[2]}; }
+  d.blend = {models:['best match (GFS/HRRR)', ...ok.map(m=>m.startsWith('ecmwf')?'ECMWF':m.startsWith('gem')?'GEM (Canada)':m)], agree: ag};
+}
 // WMO weather_code -> implied in/hr (so "raining" never scores as dry when the amount rounds to 0)
 const CODE_RATE = {51:.01,53:.02,55:.03,56:.02,57:.03,61:.04,63:.12,65:.3,66:.06,67:.15,71:.03,73:.08,75:.2,77:.02,80:.05,81:.15,82:.35,85:.08,86:.2,95:.3,96:.35,99:.4};
 const CODE_TXT = c => c==null?'':c<=1?'Clear':c==2?'Partly cloudy':c==3?'Overcast':c<=48?'Fog':c<=57?'Drizzle':c<=67?'Rain':c<=77?'Snow':c<=82?'Rain showers':c<=86?'Snow showers':'Thunderstorm';
@@ -210,7 +229,7 @@ function model(d, nr, rep){
     const score = Math.round(pa==null ? (avg(hs)||0) : ma==null ? pa : pa*CFG.DAY_WEIGHTS.prime + ma*CFG.DAY_WEIGHTS.midday);
     const src = prime.length ? prime : hs, fs = {};
     for (const key of ['temp','change','wind','cloud','precip','press','rut']) fs[key] = src.reduce((a,h)=>a+h.f[key],0)/(src.length||1);
-    return {date, k, sr, ss, hs, rp: hs.some(h=>h.rp), score, fs, reason: reason(fs, hs, src, prime), rut: rutFor(date)};
+    return {date, k, sr, ss, hs, rp: hs.some(h=>h.rp), score, fs, reason: reason(fs, hs, src, prime), rut: rutFor(date), agree: d.blend && d.blend.agree[date]};
   });
   return {hours, days: days.slice(1)}; // drop the past day (only used for day-over-day change)
 }
@@ -273,6 +292,7 @@ async function ensureState(l, idx){ if (locState(l)) { const s0 = locState(l); i
 function migrateLocs(){ const L = getLocs(); let ch = 0; L.forEach(l => { const s0 = locState(l) || bboxState(l.lat, l.lon); if (s0 && l.st !== s0) { l.st = s0; ch = 1; } }); if (ch) setLocs(L); }
 try { migrateLocs(); } catch {}
 const legalFor = (l, day) => { const k = locState(l), r = LEGAL[k||'MN']; return {a: day.sr - r.pre, b: day.ss + r.post, r, st:k||'MN', guess:!k}; };
+const agreeTxt = d => d.agree ? `<br><small class="agree" style="color:${d.agree.lvl==='High'?'#3ecf8e':d.agree.lvl==='Medium'?'#f2b84b':'#ff8a5d'}">Models agree: ${d.agree.lvl}</small>` : '';
 const legalLine = (l, d, big) => { const lg = legalFor(l, d); return `<div class="sun">☀ Sunrise ${fmtT(d.sr)} · Sunset ${fmtT(d.ss)}</div><div class="legal${big?' big':''}"><div class="lt">Legal shooting time: ${fmtT(lg.a)} – ${fmtT(lg.b)}</div><small class="rule">${lg.st}${lg.guess?' rule (state unknown)':''}: ${lg.r.rule}</small></div>`; };
 const stPicker = l => locState(l) ? '' : `<div class="legal pick">State not detected — using MN rule. Set state: <button class="sg" data-st="MN">MN</button><button class="sg" data-st="WI">WI</button></div>`;
 /* ---------- SVG charts ---------- */
@@ -333,7 +353,7 @@ function home(){
   view.innerHTML = `<form class="add" id="addF"><input id="q" placeholder="Zip code or address" autocomplete="postal-code" enterkeyhint="go"><button class="btn">Add</button></form>
   <button class="btn ghost" id="geo">📍 Use my location</button><div class="msg" id="msg"></div>
   <div id="cards">${locs.length ? '' : '<div class="card" style="color:var(--mut)">Add a zip code (try 54020) or an address to see the 7-day deer movement outlook.</div>'}</div>
-  <div class="note">An estimate from weather and calendar patterns, not a guarantee. Weather: Open-Meteo, NWS. <a href="#" id="homeStudies">Studies cited</a>. Built by Rusty Dingo Arms. <span class="ver">${VERSION}</span></div>`;
+  <div class="note">An estimate from weather and calendar patterns, not a guarantee. Weather: Open-Meteo 3-model blend (GFS/HRRR, ECMWF, GEM; median) + NWS station obs. Falls back to one model if the blend fails. <a href="#" id="homeStudies">Studies cited</a>. Built by Rusty Dingo Arms. <span class="ver">${VERSION}</span></div>`;
   $('#homeStudies').onclick = e => { e.preventDefault(); openSheet('studies'); };
   $('#addF').onsubmit = async e => { e.preventDefault(); const q = $('#q').value; if (!q.trim()) return; $('#msg').textContent = 'Finding…';
     const g = await geocode(q); if (!g) { $('#msg').textContent = 'Could not find that location. Try a 5-digit zip or "City, ST".'; return; }
@@ -356,7 +376,7 @@ async function renderCard(l, idx, n, el){
     const lh = mdl.hours.find(h=>h.live);
     const strip = nr ? `<div class="now"><div class="nowt"><b>Right now</b>${lh?` <span class="sc sm" style="background:${color(lh.s)}">${lh.s}</span>`:''}</div><div class="nowv">${nr.t!=null?Math.round(nr.t)+'°F':''} · ${nr.w!=null?Math.round(nr.w)+' mph '+(nr.wd!=null?compass16(nr.wd):''):''} · ${esc(nr.sky)} · <b style="color:${rep&&rep.lvl==='dry'?'#3ecf8e':nr.wet||rep?'#5aa9ff':'inherit'}">${rep?(rep.lvl==='dry'?'Dry (you)':'Rain (you)'):nr.wet?'Wet '+nr.rate.toFixed(2)+'"/hr':'Dry'}</b>${lh&&lh.f.precip<-0.5?` (${Math.round(lh.f.precip)} pts)`:''}</div><small>Next hour: <b>${nr.firstWet?(nr.firstWet.in<=0?'raining now':'rain in ~'+nr.firstWet.in+' min')+' ('+nr.firstWet.rate.toFixed(2)+'"/hr, Open-Meteo 15-min)':'no rain in Open-Meteo 15-min nowcast'}</b> · next 2 hr max ${nr.next2>0.004?nr.next2.toFixed(2)+'"/hr':'dry'}${nr.h0?' · NWS '+nr.pp2+'% · '+esc(nr.h0.txt):''}<br>📍 ${esc(l.name)} · ${nr.ob?`NWS ${nr.ob.id}${nr.ob.mi!=null?' ('+Math.round(nr.ob.mi)+' mi away)':''} obs ${fmtClock(nr.ob.ts)}`:'No nearby NWS obs'}${nr.omTime?` · Open-Meteo ${fmtT(tm(nr.omTime))}`:''}${nc.stale?' · offline':''}</small>${rainUI(rep)}</div>` : rainUI(rep);
     el.innerHTML = head + `<div class="todayLegal">Today · ${legalLine(l, mdl.days[0], 1)}</div>` + stPicker(l) + strip + (c.stale?'<div class="msg">Offline: showing last saved forecast.</div>':'') + '<div class="days">' + mdl.days.map((d,k) => { const dt = new Date(Date.UTC(...d.date.split('-').map((v,i)=>i==1?v-1:+v)));
-      return `<button class="day" data-k="${k}"><div class="dn"><b>${k===0?'Today':DOW[dt.getUTCDay()]}</b><small>${dt.getUTCMonth()+1}/${dt.getUTCDate()}</small></div><div class="sc" style="background:${color(d.score)}">${d.score}</div><div class="why"><b>${label(d.score)}</b> · ${d.rut.name}<br>${esc(d.reason)}${legalLine(l,d)}</div></button>`; }).join('') + '</div>';
+      return `<button class="day" data-k="${k}"><div class="dn"><b>${k===0?'Today':DOW[dt.getUTCDay()]}</b><small>${dt.getUTCMonth()+1}/${dt.getUTCDate()}</small></div><div class="sc" style="background:${color(d.score)}">${d.score}</div><div class="why"><b>${label(d.score)}</b> · ${d.rut.name}<br>${esc(d.reason)}${agreeTxt(d)}${legalLine(l,d)}</div></button>`; }).join('') + '</div>';
     bind(); el.querySelectorAll('[data-rain]').forEach(b => b.onclick = () => { setRain(l, b.dataset.rain); delete state.data[idx]; renderCard(l, idx, n, el); });
     el.querySelectorAll('[data-st]').forEach(b => b.onclick = () => { const L = getLocs(); if (L[idx]) { L[idx].st = b.dataset.st; setLocs(L); } l.st = b.dataset.st; renderCard(l, idx, n, el); });
     el.querySelectorAll('.day').forEach(b => b.onclick = () => detail(idx, +b.dataset.k));
@@ -383,7 +403,7 @@ function detail(idx, k){
     const fsRow = Object.entries(day.fs).map(([kk,v])=>`<div class="fact"><small>${{temp:'Temperature',change:'Change vs yesterday',wind:'Wind',cloud:'Sky (cloud × temp)',precip:'Rain / snow / fog',press:'Pressure / fronts',rut:'Rut phase'}[kk]}</small><b style="color:${v>0.5?'#3ecf8e':v<-0.5?'#ff5d5d':'#e6e9ee'}">${v>0?'+':''}${v.toFixed(1)} pts</b></div>`).join('');
     view.innerHTML = `<div class="card"><div class="ch"><h3>${esc(l.name)} · ${DOW[dt.getUTCDay()]} ${dt.getUTCMonth()+1}/${dt.getUTCDate()}</h3><div class="sc" style="background:${color(day.score)}">${day.score}</div></div>
       <div class="why"><b>${label(day.score)}</b> · ${esc(day.reason)}</div>${legalLine(l, day, 1)}
-      <div class="facts" style="margin-top:10px"><div class="fact"><small>Sunrise / Sunset</small><b>${fmtT(day.sr)} / ${fmtT(day.ss)}</b></div><div class="fact"><small>Best hour (daylight)</small><b>${fmtT(best.m)} · ${best.s}</b></div><div class="fact"><small>Legal shooting hours (${lg.st}${lg.guess?'?':''})</small><b style="color:#3ecf8e">${lgTxt}</b></div><div class="fact"><small>Rut phase</small><b>${day.rut.name}${day.rut.bonus?' +'+day.rut.bonus:''}</b></div><div class="fact"><small>Prevailing wind (daylight)</small><b>${prevail(day.hs.filter(h=>h.m>=day.sr&&h.m<=day.ss))} · ${Math.round(Math.max(...day.hs.map(h=>h.w)))} mph max</b></div><div class="fact"><small>Temp range</small><b>${Math.round(Math.min(...day.hs.map(h=>h.t)))}–${Math.round(Math.max(...day.hs.map(h=>h.t)))}°F</b></div></div></div>
+      <div class="facts" style="margin-top:10px"><div class="fact"><small>Sunrise / Sunset</small><b>${fmtT(day.sr)} / ${fmtT(day.ss)}</b></div><div class="fact"><small>Best hour (daylight)</small><b>${fmtT(best.m)} · ${best.s}</b></div><div class="fact"><small>Legal shooting hours (${lg.st}${lg.guess?'?':''})</small><b style="color:#3ecf8e">${lgTxt}</b></div><div class="fact"><small>Forecast agreement (3 models)</small><b>${day.agree?`${day.agree.lvl} · ±${(day.agree.t/2).toFixed(1)}°F, rain ${day.agree.p.toFixed(2)}" spread`:'single model'}</b></div><div class="fact"><small>Rut phase</small><b>${day.rut.name}${day.rut.bonus?' +'+day.rut.bonus:''}</b></div><div class="fact"><small>Prevailing wind (daylight)</small><b>${prevail(day.hs.filter(h=>h.m>=day.sr&&h.m<=day.ss))} · ${Math.round(Math.max(...day.hs.map(h=>h.w)))} mph max</b></div><div class="fact"><small>Temp range</small><b>${Math.round(Math.min(...day.hs.map(h=>h.t)))}–${Math.round(Math.max(...day.hs.map(h=>h.t)))}°F</b></div></div></div>
       <div class="card"><div class="tabs">${f15?`<button class="tab ${res==='15'?'on':''}" data-r="15">15-min</button>`:''}<button class="tab ${res==='60'?'on':''}" data-r="60">Hourly</button></div>
       <div class="tip" id="tip">Tap or drag a chart. Orange bands are the dawn/dusk prime windows; dark is night; green dashed lines + bar mark legal shooting hours.</div>
       <div class="ct"><span>Favorability</span><span class="chips">${chip('Dawn',dawnA)}${chip('Dusk',duskA)}</span></div>${chart(pts,'s',{day,legal:lg,min:Math.floor(smin/5)*5,max:Math.ceil(smax/5)*5,bands:1,win,ticks:3,h:140})}
@@ -428,18 +448,45 @@ const STUDIES = [
  {t:'Productivity of White-Tailed Deer in Central Wisconsin (thesis)', a:'Clark, UW–Stevens Point', y:1981, u:'http://digital.library.wisc.edu/1793/79636', f:'rut timing',
   x:'90 does, fetal aging: 67% bred Nov 8–Dec 5; adult peak Nov 15–21, yearlings Nov 22–28, doe fawns ~1 month later.', r:'abstract'},
  {t:'Hunting deer with a rifle, shotgun or muzzleloader', a:'Minnesota DNR', y:2026, u:'https://www.dnr.state.mn.us/gohunting/firearms-deer-hunting.html', f:'rut timing',
-  x:'Minnesota whitetails mate from November to early December.', r:'full page'}];
+  x:'Minnesota whitetails mate from November to early December.', r:'full page'},
+ {t:'Measuring Fine-Scale White-Tailed Deer Movements and Environmental Influences Using GPS Collars', a:'Webb, Gee, Strickland, Demarais, DeYoung (Int. J. Ecology)', y:2010, u:'https://onlinelibrary.wiley.com/doi/10.1155/2010/459610', f:'temp, wind, pressure, moon, rut, dawn/dusk', c:'Strong (but Oklahoma)',
+  x:'Original paper (replaces reliance on the magazine summary). 32 GPS deer, 130,098 fixes at 15 min. Movement mainly crepuscular; bucks moved 20% more in rut than post-rut; moon phase no effect; hourly/daily weather inconsistent and minimal.', r:'abstract + methods'},
+ {t:'Effects of Abiotic Factors on White-tailed Deer Activity in South Carolina (full thesis, ch. 2)', a:'Goethlich, Ditchkoff, Gulsby, Collier, Auburn Univ.', y:2020, u:'https://etd.auburn.edu/bitstream/handle/10415/7077/Goethlich_Thesis.pdf?isAllowed=y&sequence=2', f:'pressure trends/fronts', c:'Moderate, conflicting by time of day',
+  x:'4-hr rate of pressure change beat absolute pressure as a predictor. In most seasons/daytime, activity was LOWER while pressure fell fast and higher as it rose; some evening periods showed the opposite. Basis for removing the v8 falling-baro bonus.', r:'full PDF (pressure results)'},
+ {t:'The Breeding Season and Movement Ecology of Male White-Tailed Deer in Southwest Wisconsin (full text)', a:'Hunsaker et al., WI DNR (Ecology & Evolution)', y:2025, u:'https://pmc.ncbi.nlm.nih.gov/articles/PMC12240682/', f:'rut timing, hunting pressure', c:'Strong for WI',
+  x:'188 GPS bucks, Oct 15–Dec 1, 2017–2020: changepoint analysis puts peak breeding-season movement Oct 23–Nov 12 with little variation by age; firearm opening weekend had no significant effect on movement. Basis for v9 rut calendar.', r:'full text'},
+ {t:'Impact of Hunting Pressure on Adult Male White-tailed Deer Behavior', a:'Karns, Lancia, DePerno, Conner (SEAFWA J.)', y:2012, u:'https://seafwa.org/journal/2012/impact-hunting-pressure-adult-male-white-tailed-deer-behavior', f:'hunting pressure, dawn/dusk', c:'Weak (9 bucks)',
+  x:'9 GPS bucks, Maryland firearm season: movement fell 120→89 m per 20 min and activity 32→22%, but overlapped post-rut; during the hunt movement was higher at dusk/night than dawn/day; no change in harvest vulnerability. Not scored (we can\u2019t see local pressure).', r:'full PDF'},
+ {t:'Behaviour of a large ungulate reflects temporal patterns of predation risk', a:'Wiskirchen, Jacobsen, Ditchkoff, Demarais, Gitzen (Wildlife Research)', y:2022, u:'https://doi.org/10.1071/wr21047', f:'hunting pressure', c:'Moderate',
+  x:'Alabama GPS deer: daytime movement 17% lower, activity 24% lower on Sundays vs Fridays after weekend hunting; effect lasted to Wednesday; no night change. Not scored (needs local hunter data).', r:'abstract'},
+ {t:'Reproductive steroids in the white-tailed deer (O. v. borealis). I. Seasonal changes in the female', a:'Plotka et al., USGS / Minnesota', y:1977, u:'https://pubs.usgs.gov/publication/70195648', f:'second rut', c:'Moderate',
+  x:'77 Minnesota does: unbred does keep cycling every ~25–30 days from November into early March. Supports a small December second-rut bump.', r:'abstract'},
+ {t:'Natural history of deer in Minnesota', a:'Minnesota DNR', y:2026, u:'https://www.dnr.state.mn.us/mammals/deer/management/history.html', f:'rut timing', c:'Agency statement',
+  x:'"White-tailed deer mate from November to early December." No MN conception-date study was found, so the calendar leans on Wisconsin data.', r:'full page'},
+ {t:'Winter range arrival and departure of white-tailed deer in northeastern Minnesota', a:'Nelson (Can. J. Zoology)', y:1995, u:'https://doi.org/10.1139/z95-127', f:'temp, snow (late season, N. MN)', c:'Strong for NE MN',
+  x:'194 radio-collared deer, 1975–93: first temps below about 19°F together with snowfall triggered fall migration to winter yards in 45% of does. Explains late-season shifts near McKinley; not a daily movement score.', r:'abstract'},
+ {t:'A Long-Term Assessment of the Variability in Winter Use of Dense Conifer Cover by Female White-Tailed Deer', a:'Fieberg et al., MN DNR / Univ. of Minnesota (PLOS One)', y:2013, u:'https://journals.plos.org/plosone/article?id=10.1371%2Fjournal.pone.0065368', f:'snow depth, cold, sky', c:'Moderate',
+  x:'291 collared does, north-central MN, 12 yrs: deep snow pushed deer into dense conifer; on the coldest days they used open cover more in daytime (sun). Supports keeping “clear + cold” positive and deep snow negative.', r:'abstract'},
+ {t:'Movements and Habitat Use of White-Tailed Deer in Minnesota', a:'Rongstad & Tester (J. Wildlife Mgmt.)', y:1969, u:'https://doi.org/10.2307/3799837', f:'snow', c:'Weak (14 deer)',
+  x:'East-central MN radio-tracking: winter home ranges shrank as snow depth increased. Supports the heavy-snow penalty.', r:'first page'},
+ {t:'Testing Some Elements of the Hunters\u2019 Folklore (camera traps vs. weather)', a:'Dixon & Santiago-Blay (Life: Excitement of Biology)', y:2021, u:'https://blaypublishers.com/wp-content/uploads/2022/04/dixon_and_santiago-blay_leb93-1.pdf', f:'temp, pressure, moon, wind', c:'Weak (1 site, ~10 days, cameras)',
+  x:'PA trail cameras: more deer at mild temps, slightly below-normal pressure, new/full moon, calm–mild wind. Tiny sample; conflicts with GPS studies on moon. Listed for completeness, not used.', r:'full PDF'},
+ {t:'Can multi-model combination really enhance the prediction skill of probabilistic ensemble forecasts?', a:'Weigel, Liniger, Appenzeller (Q. J. R. Meteorol. Soc.)', y:2008, u:'https://doi.org/10.1002/qj.210', f:'weather sources', c:'Strong (forecasting)',
+  x:'Multi-model combinations can beat the best single model mainly by cancelling overconfidence. Basis for blending 3 models.', r:'abstract'},
+ {t:'National Blend of Models (NBM) Temperature verification', a:'NOAA Colorado Basin RFC', y:2018, u:'https://www.cbrfc.noaa.gov/present/projects/NBM_Temperature.pdf', f:'weather sources', c:'Moderate',
+  x:'Verification over days 1–10: blended (and bias-corrected) NBM temperature beat single-model GFS MOS; NWS now starts from the blend.', r:'full PDF'}];
 const EVID = [ // factor, range in app, evidence, why
  ['Rain / drizzle / storm','× 0.35–0.70, capped 10–40','Moderate (bucks)','PSU collars, replicated 2 yrs: bucks ~35–40% less travel in rain; does unaffected. Auburn saw no drop in drizzle. Wind offsets it.'],
- ['Rut phase','+3 to +10','Strong','MSU (48 bucks), Webb (+20%), WI 188 bucks: rut timing beats any weather factor.'],
+ ['Rut phase','+3 to +10','Strong','MSU (48 bucks), Webb (+20%), WI DNR 188 bucks (peak Oct 23–Nov 12): rut timing beats any weather factor. v9 calendar follows the WI dates.'],
+ ['Hunting pressure','not used','Moderate (but local)','Alabama: −17% daytime movement after weekend hunting; WI: opener no effect. We can\u2019t see pressure on your land, so it isn\u2019t scored.'],
  ['Temperature (heat)','−20 to +8','Moderate','Most often significant weather factor (Webb); heat cuts activity (TX). Cool-is-better is consistent but small.'],
  ['Wind','−10 to +4','Weak / conflicting','PSU: bucks moved more with wind. Auburn: less post-rut. Only extremes penalized.'],
  ['Sky (cloud × temp)','−6 to +5','Weak','No collar study isolates cloud cover. Treated as heat load: clear + cold good, sunny + warm bad, overcast ≈ neutral.'],
  ['Fog','× 0.85, cap 55','Weak','Not studied directly; mild penalty for visibility, not deer behavior.'],
  ['Snow','light ×0.95 · heavy ×0.55','Weak','No collar data found; light snow left near neutral, heavy snow treated like steady rain.'],
- ['Pressure / fronts','0 to +3','Weak / not supported','Webb (via NAW), MSU, NDA/PSU front data: no consistent effect. Kept tiny.'],
+ ['Pressure / fronts','0 to +3 (v9: falling-baro bonus removed)','Weak / conflicting','Webb, MSU, NDA/PSU: no consistent effect. Auburn full thesis: activity usually lower while pressure falls fast, higher as it rises. Only post-front rise gets a small bonus.'],
  ['Temp change vs yesterday','−6 to +8','Weak','PSU found no change through a cold front or warm snap. Kept small.'],
- ['Moon','not used','No effect','Webb, MSU (48 bucks), PSU: moon phase/position had no measurable effect.']];
+ ['Moon','not used','No effect / weak','Webb, MSU (48 bucks), PSU GPS: no measurable effect. Only a 10-day camera study found one.']];
 const howHTML = () => `<h2>How the score works</h2>
 <p><b>Short version:</b> research says the calendar (rut) and dawn/dusk drive deer movement much more than weather. Of the weather factors, <b>rain</b> has the clearest effect on <b>bucks</b> (roughly 35–40% less travel in Penn State's collar data), then heat. Wind, clouds, pressure and fronts show weak or conflicting effects. So rain now pulls the score down hard, and the others nudge it.</p>
 <ol><li><b>Dry score</b> = 50 + temperature + change vs yesterday + wind/gusts + sky + pressure + rut. Non-rain weather terms are damped 25% in the dawn/dusk windows, because Auburn found weather matters least then.</li>
@@ -466,8 +513,8 @@ const howHTML = () => `<h2>How the score works</h2>
 <tr><td style="color:${CFG.BANDS[0][3]}">under 35</td><td>Poor</td><td>Raining, storms, heat, or very high wind</td></tr></table>
 <p class="small">Rain caps above are in raw points; shown as calibrated they're about: ${Object.values(CFG.WET).map(([m,c,l])=>`${l} ${Math.round(cal(c))}`).join(' · ')}. Factor breakdown is in raw model points. This is an estimate, not a validated model.</p><p class="ver">Version ${VERSION}</p>`;
 const studiesHTML = () => `<h2>Studies cited</h2><p>Sources behind the weights. "Read" says how much of each we actually read. Weak or conflicting evidence is flagged in <a href="#" id="toHow">How the score works</a>.</p>
-${STUDIES.map(s=>`<div class="study"><b><a href="${s.u}" target="_blank" rel="noopener">${esc(s.t)}</a></b><br><small>${esc(s.a)} · ${s.y} · informs: <b>${s.f}</b></small><div>${esc(s.x)}</div><small class="mut">Read: ${s.r}</small></div>`).join('')}
-<p class="small">Not used: solunar / moon tables, "deer movement index" apps (no published validation found).</p><p class="ver">Version ${VERSION}</p>`;
+${STUDIES.map(s=>`<div class="study"><b><a href="${s.u}" target="_blank" rel="noopener">${esc(s.t)}</a></b><br><small>${esc(s.a)} · ${s.y} · informs: <b>${s.f}</b></small><div>${esc(s.x)}</div><small class="mut">Read: ${s.r}${s.c?` · Confidence: <b>${s.c}</b>`:''}</small></div>`).join('')}
+<p class="small">Weather sources (v9): forecast is the median of three free models from Open-Meteo (best match = GFS/HRRR in the US, ECMWF, Canada GEM); rain chance is their average. Each day shows how well they agree. Right-now conditions still come from the nearest NWS station. If the extra models fail, the app quietly uses the single model.</p><p class="small">Not used: solunar / moon tables, "deer movement index" apps (no published validation found).</p><p class="ver">Version ${VERSION}</p>`;
 function openSheet(which){ $('#howBody').innerHTML = which==='studies' ? studiesHTML() : howHTML(); $('#sheet').hidden = false; $('#sheet .sheetin').scrollTop = 0;
   const a = $('#toStudies'), b = $('#toHow'); if (a) a.onclick = () => openSheet('studies'); if (b) b.onclick = e => { e.preventDefault(); openSheet('how'); }; }
 $('#howBtn').onclick = () => openSheet('how');
