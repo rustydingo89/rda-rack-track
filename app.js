@@ -1,5 +1,5 @@
 'use strict';
-const VERSION = 'rt-v6';
+const VERSION = 'rt-v7';
 /* RDA Rack Track: whitetail movement favorability estimate. All tunables up here. */
 const CFG = {
   BASE: 50,
@@ -256,11 +256,25 @@ const LEGAL = {
   MN: {pre:30, post:30, rule:'½ hour before sunrise to ½ hour after sunset', src:'https://www.revisor.mn.gov/statutes/cite/97B.075', srcName:'Minn. Stat. 97B.075(b) (big game)'},
   WI: {pre:30, post:20, rule:'30 min before sunrise to 20 min after sunset', src:'https://dnr.wisconsin.gov/topic/Hunt/regulations/OnlineHuntingRegulations/ShootingHoursDeerBearElkSmallGameFallTurkey', srcName:'WI DNR deer shooting hours tables', note:'WI officially uses printed DNR tables by area and longitude zone; this is computed from local sunrise/sunset and may differ by a few minutes.'}};
 const ST_ABBR = {minnesota:'MN', wisconsin:'WI', mn:'MN', wi:'WI'};
-function locState(l){ const raw = (l.st || (String(l.name).split(',').pop()||'')).trim().toLowerCase(); return ST_ABBR[raw] || null; }
-async function ensureState(l, idx){ if (l.st != null && l.st !== '') return; if (locState(l)) return;
-  try { const r = await (await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&zoom=5&lat=${l.lat}&lon=${l.lon}`)).json(); const st = (r.address||{}).state||'-';
-    const L = getLocs(); if (L[idx] && L[idx].lat===l.lat) { L[idx].st = st; setLocs(L); } l.st = st; } catch {} }
-const legalFor = (l, day) => { const r = LEGAL[locState(l)]; return r ? {a: day.sr - r.pre, b: day.ss + r.post, r} : null; };
+function bboxState(lat, lon){ if (lat==null||lon==null) return null;
+  const inMN = lat>=43.49&&lat<=49.39&&lon>=-97.24&&lon<=-89.48, inWI = lat>=42.49&&lat<=47.31&&lon>=-92.89&&lon<=-86.8;
+  if (inMN && !inWI) return 'MN'; if (inWI && !inMN) return 'WI';
+  if (inMN && inWI) { if (lat>46.8 && lon<-92.0) return 'MN'; if (lon<=-92.75) return 'MN'; if (lon>=-92.6 && lat<46.6) return 'WI'; }
+  return null; }
+function locState(l){ if (!l) return null; const pick = v => ST_ABBR[String(v||'').trim().toLowerCase()] || null;
+  if (l.st && pick(l.st)) return pick(l.st);
+  const nm = String(l.name||''); const m = nm.match(/\b(Minnesota|Wisconsin)\b/i) || nm.match(/,\s*(MN|WI)\b/i); if (m) return pick(m[1]);
+  return pick(nm.split(',').pop()); }
+async function ensureState(l, idx){ if (locState(l)) { const s0 = locState(l); if (l.st !== s0) { const L = getLocs(); if (L[idx] && L[idx].lat===l.lat) { L[idx].st = s0; setLocs(L); } l.st = s0; } return; }
+  let st = null;
+  try { const r = await (await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&zoom=5&lat=${l.lat}&lon=${l.lon}`)).json(); st = ST_ABBR[String((r.address||{}).state||'').toLowerCase()] || null; } catch {}
+  st = st || bboxState(l.lat, l.lon); if (!st) return;
+  const L = getLocs(); if (L[idx] && L[idx].lat===l.lat) { L[idx].st = st; setLocs(L); } l.st = st; }
+function migrateLocs(){ const L = getLocs(); let ch = 0; L.forEach(l => { const s0 = locState(l) || bboxState(l.lat, l.lon); if (s0 && l.st !== s0) { l.st = s0; ch = 1; } }); if (ch) setLocs(L); }
+try { migrateLocs(); } catch {}
+const legalFor = (l, day) => { const k = locState(l), r = LEGAL[k||'MN']; return {a: day.sr - r.pre, b: day.ss + r.post, r, st:k||'MN', guess:!k}; };
+const legalLine = (l, d, big) => { const lg = legalFor(l, d); return `<div class="legal${big?' big':''}"><span class="pill">🎯 Legal shooting time: ${fmtT(lg.a)} – ${fmtT(lg.b)}</span><small class="rule">${lg.st}${lg.guess?' rule (state unknown)':''}: ${lg.r.rule}</small></div><div class="sun">☀ Sunrise ${fmtT(d.sr)} · Sunset ${fmtT(d.ss)}</div>`; };
+const stPicker = l => locState(l) ? '' : `<div class="legal pick">State not detected — using MN rule. Set state: <button class="sg" data-st="MN">MN</button><button class="sg" data-st="WI">WI</button></div>`;
 /* ---------- SVG charts ---------- */
 function chart(pts, key, opt){
   const W = 360, H = opt.h||110, L = 30, R = 8, Tp = opt.dirs ? 18 : 8, B = 18, x0 = pts[0].m, x1 = pts[pts.length-1].m;
@@ -271,7 +285,7 @@ function chart(pts, key, opt){
   let g = '';
   const {sr, ss} = opt.day;
   g += `<rect x="${L}" y="${Tp}" width="${Math.max(0,X(sr)-L)}" height="${H-Tp-B}" fill="#000" opacity=".35"/><rect x="${X(ss)}" y="${Tp}" width="${Math.max(0,W-R-X(ss))}" height="${H-Tp-B}" fill="#000" opacity=".35"/>`;
-  if (opt.legal){ const la = X(Math.max(x0,opt.legal.a)), lb = X(Math.min(x1,opt.legal.b)); g += `<rect x="${la}" y="${H-B-3}" width="${Math.max(0,lb-la)}" height="3" fill="#3ecf8e" opacity=".8"/><line x1="${la}" x2="${la}" y1="${Tp}" y2="${H-B}" stroke="#3ecf8e" stroke-width=".8" stroke-dasharray="2 3" opacity=".7"/><line x1="${lb}" x2="${lb}" y1="${Tp}" y2="${H-B}" stroke="#3ecf8e" stroke-width=".8" stroke-dasharray="2 3" opacity=".7"/>`; }
+  if (opt.legal){ const la = X(Math.max(x0,opt.legal.a)), lb = X(Math.min(x1,opt.legal.b)); g += `<rect x="${la}" y="${H-B-3}" width="${Math.max(0,lb-la)}" height="3" fill="#3ecf8e" opacity=".8"/><line x1="${la}" x2="${la}" y1="${Tp}" y2="${H-B}" stroke="#3ecf8e" stroke-width=".8" stroke-dasharray="2 3" opacity=".7"/><line x1="${lb}" x2="${lb}" y1="${Tp}" y2="${H-B}" stroke="#3ecf8e" stroke-width=".8" stroke-dasharray="2 3" opacity=".7"/><text x="${la+2}" y="${Tp+8}" fill="#3ecf8e" font-size="8">Legal ${fmtT(opt.legal.a)}</text><text x="${lb-2}" y="${Tp+8}" fill="#3ecf8e" font-size="8" text-anchor="end">${fmtT(opt.legal.b)}</text><rect x="${la}" y="${Tp}" width="${Math.max(0,lb-la)}" height="${H-Tp-B}" fill="#3ecf8e" opacity=".05"/>`; }
   for (const [a,b] of [[sr+CFG.PRIME_DAWN[0], sr+CFG.PRIME_DAWN[1]], [ss+CFG.PRIME_DUSK[0], ss+CFG.PRIME_DUSK[1]]])
     g += `<rect x="${X(a)}" y="${Tp}" width="${X(b)-X(a)}" height="${H-Tp-B}" fill="#e8792b" opacity=".13"/>`;
   if (opt.bands) for (const [a,b,nm,c] of CFG.BANDS){ const ya = Y(clamp(a,lo,hi)), yb = Y(clamp(b,lo,hi)); if (ya-yb < 1) continue;
@@ -341,9 +355,10 @@ async function renderCard(l, idx, n, el){
     const [c, nc] = await Promise.all([weather(l), nowcast(l).catch(()=>null), ensureState(l, idx)]), nr = nc ? nowRead(nc) : null, rep = getRain(l), mdl = model(c.d, nr, rep); state.data[idx] = c.d; state.models[idx] = mdl;
     const lh = mdl.hours.find(h=>h.live);
     const strip = nr ? `<div class="now"><div class="nowt"><b>Right now</b>${lh?` <span class="sc sm" style="background:${color(lh.s)}">${lh.s}</span>`:''}</div><div class="nowv">${nr.t!=null?Math.round(nr.t)+'°F':''} · ${nr.w!=null?Math.round(nr.w)+' mph '+(nr.wd!=null?compass16(nr.wd):''):''} · ${esc(nr.sky)} · <b style="color:${rep&&rep.lvl==='dry'?'#3ecf8e':nr.wet||rep?'#5aa9ff':'inherit'}">${rep?(rep.lvl==='dry'?'Dry (you)':'Rain (you)'):nr.wet?'Wet '+nr.rate.toFixed(2)+'"/hr':'Dry'}</b>${lh&&lh.f.precip<-0.5?` (${Math.round(lh.f.precip)} pts)`:''}</div><small>Next hour: <b>${nr.firstWet?(nr.firstWet.in<=0?'raining now':'rain in ~'+nr.firstWet.in+' min')+' ('+nr.firstWet.rate.toFixed(2)+'"/hr, Open-Meteo 15-min)':'no rain in Open-Meteo 15-min nowcast'}</b> · next 2 hr max ${nr.next2>0.004?nr.next2.toFixed(2)+'"/hr':'dry'}${nr.h0?' · NWS '+nr.pp2+'% · '+esc(nr.h0.txt):''}<br>📍 ${esc(l.name)} · ${nr.ob?`NWS ${nr.ob.id}${nr.ob.mi!=null?' ('+Math.round(nr.ob.mi)+' mi away)':''} obs ${fmtClock(nr.ob.ts)}`:'No nearby NWS obs'}${nr.omTime?` · Open-Meteo ${fmtT(tm(nr.omTime))}`:''}${nc.stale?' · offline':''}</small>${rainUI(rep)}</div>` : rainUI(rep);
-    el.innerHTML = head + strip + (c.stale?'<div class="msg">Offline: showing last saved forecast.</div>':'') + '<div class="days">' + mdl.days.map((d,k) => { const dt = new Date(Date.UTC(...d.date.split('-').map((v,i)=>i==1?v-1:+v)));
-      return `<button class="day" data-k="${k}"><div class="dn"><b>${k===0?'Today':DOW[dt.getUTCDay()]}</b><small>${dt.getUTCMonth()+1}/${dt.getUTCDate()}</small></div><div class="sc" style="background:${color(d.score)}">${d.score}</div><div class="why"><b>${label(d.score)}</b> · ${d.rut.name}<br>${esc(d.reason)}<br><small class="mut">☀ ${fmtT(d.sr)}–${fmtT(d.ss)}${(lg=>lg?` · <span style="color:#3ecf8e">Legal ${fmtT(lg.a)}–${fmtT(lg.b)}</span>`:'')(legalFor(l,d))}</small></div></button>`; }).join('') + '</div>';
+    el.innerHTML = head + `<div class="todayLegal">Today · ${legalLine(l, mdl.days[0], 1)}</div>` + stPicker(l) + strip + (c.stale?'<div class="msg">Offline: showing last saved forecast.</div>':'') + '<div class="days">' + mdl.days.map((d,k) => { const dt = new Date(Date.UTC(...d.date.split('-').map((v,i)=>i==1?v-1:+v)));
+      return `<button class="day" data-k="${k}"><div class="dn"><b>${k===0?'Today':DOW[dt.getUTCDay()]}</b><small>${dt.getUTCMonth()+1}/${dt.getUTCDate()}</small></div><div class="sc" style="background:${color(d.score)}">${d.score}</div><div class="why"><b>${label(d.score)}</b> · ${d.rut.name}<br>${esc(d.reason)}${legalLine(l,d)}</div></button>`; }).join('') + '</div>';
     bind(); el.querySelectorAll('[data-rain]').forEach(b => b.onclick = () => { setRain(l, b.dataset.rain); delete state.data[idx]; renderCard(l, idx, n, el); });
+    el.querySelectorAll('[data-st]').forEach(b => b.onclick = () => { const L = getLocs(); if (L[idx]) { L[idx].st = b.dataset.st; setLocs(L); } l.st = b.dataset.st; renderCard(l, idx, n, el); });
     el.querySelectorAll('.day').forEach(b => b.onclick = () => detail(idx, +b.dataset.k));
   } catch (e) { el.innerHTML = head + `<div class="msg">Forecast unavailable (${esc(e.message)}). Check your connection.</div>`; bind(); }
 }
@@ -356,7 +371,7 @@ function rainUI(rep){
 function detail(idx, k){
   const l = getLocs()[idx], d = state.data[idx], mdl = state.models[idx], day = mdl.days[k]; if (!day) return home();
   location.hash = 'd'; $('#back').hidden = false; window.scrollTo(0,0);
-  const f15 = fine(d, mdl, day), lg = legalFor(l, day), lgTxt = lg ? `${fmtT(lg.a)} – ${fmtT(lg.b)}` : 'n/a (state unknown)'; let res = f15 ? '15' : '60';
+  const f15 = fine(d, mdl, day), lg = legalFor(l, day), lgTxt = `${fmtT(lg.a)} – ${fmtT(lg.b)}`; let res = f15 ? '15' : '60';
   const draw = () => {
     const pts = res==='15' && f15 ? f15 : day.hs, dt = new Date(Date.UTC(...day.date.split('-').map((v,i)=>i==1?v-1:+v)));
     const best = [...day.hs].filter(h=>h.m>=day.sr-60&&h.m<=day.ss+30).sort((a,b)=>b.s-a.s)[0] || day.hs[0];
@@ -367,8 +382,8 @@ function detail(idx, k){
     const chip = (n,v) => v==null?'':`<span>${n} <b style="color:${color(v)}">${v}</b></span>`;
     const fsRow = Object.entries(day.fs).map(([kk,v])=>`<div class="fact"><small>${{temp:'Temperature',change:'Change vs yesterday',wind:'Wind',cloud:'Sky (cloud × temp)',precip:'Rain / snow / fog',press:'Pressure / fronts',rut:'Rut phase'}[kk]}</small><b style="color:${v>0.5?'#3ecf8e':v<-0.5?'#ff5d5d':'#e6e9ee'}">${v>0?'+':''}${v.toFixed(1)} pts</b></div>`).join('');
     view.innerHTML = `<div class="card"><div class="ch"><h3>${esc(l.name)} · ${DOW[dt.getUTCDay()]} ${dt.getUTCMonth()+1}/${dt.getUTCDate()}</h3><div class="sc" style="background:${color(day.score)}">${day.score}</div></div>
-      <div class="why"><b>${label(day.score)}</b> · ${esc(day.reason)}</div>
-      <div class="facts" style="margin-top:10px"><div class="fact"><small>Sunrise / Sunset</small><b>${fmtT(day.sr)} / ${fmtT(day.ss)}</b></div><div class="fact"><small>Best hour (daylight)</small><b>${fmtT(best.m)} · ${best.s}</b></div><div class="fact"><small>Legal shooting hours${lg?' ('+locState(l)+')':''}</small><b style="color:#3ecf8e">${lgTxt}</b></div><div class="fact"><small>Rut phase</small><b>${day.rut.name}${day.rut.bonus?' +'+day.rut.bonus:''}</b></div><div class="fact"><small>Prevailing wind (daylight)</small><b>${prevail(day.hs.filter(h=>h.m>=day.sr&&h.m<=day.ss))} · ${Math.round(Math.max(...day.hs.map(h=>h.w)))} mph max</b></div><div class="fact"><small>Temp range</small><b>${Math.round(Math.min(...day.hs.map(h=>h.t)))}–${Math.round(Math.max(...day.hs.map(h=>h.t)))}°F</b></div></div></div>
+      <div class="why"><b>${label(day.score)}</b> · ${esc(day.reason)}</div>${legalLine(l, day, 1)}
+      <div class="facts" style="margin-top:10px"><div class="fact"><small>Sunrise / Sunset</small><b>${fmtT(day.sr)} / ${fmtT(day.ss)}</b></div><div class="fact"><small>Best hour (daylight)</small><b>${fmtT(best.m)} · ${best.s}</b></div><div class="fact"><small>Legal shooting hours (${lg.st}${lg.guess?'?':''})</small><b style="color:#3ecf8e">${lgTxt}</b></div><div class="fact"><small>Rut phase</small><b>${day.rut.name}${day.rut.bonus?' +'+day.rut.bonus:''}</b></div><div class="fact"><small>Prevailing wind (daylight)</small><b>${prevail(day.hs.filter(h=>h.m>=day.sr&&h.m<=day.ss))} · ${Math.round(Math.max(...day.hs.map(h=>h.w)))} mph max</b></div><div class="fact"><small>Temp range</small><b>${Math.round(Math.min(...day.hs.map(h=>h.t)))}–${Math.round(Math.max(...day.hs.map(h=>h.t)))}°F</b></div></div></div>
       <div class="card"><div class="tabs">${f15?`<button class="tab ${res==='15'?'on':''}" data-r="15">15-min</button>`:''}<button class="tab ${res==='60'?'on':''}" data-r="60">Hourly</button></div>
       <div class="tip" id="tip">Tap or drag a chart. Orange bands are the dawn/dusk prime windows; dark is night; green dashed lines + bar mark legal shooting hours.</div>
       <div class="ct"><span>Favorability</span><span class="chips">${chip('Dawn',dawnA)}${chip('Dusk',duskA)}</span></div>${chart(pts,'s',{day,legal:lg,min:Math.floor(smin/5)*5,max:Math.ceil(smax/5)*5,bands:1,win,ticks:3,h:140})}
@@ -380,7 +395,7 @@ function detail(idx, k){
       <div class="ct"><span>Rain chance %</span><span>Open-Meteo hourly</span></div>${chart(pts,'pp',{day,legal:lg,color:'#5aa9ff',min:0,max:100})}
       <div class="ct"><span>Pressure hPa (trend)</span><span>${(day.hs[day.hs.length-1].p-day.hs[0].p>0?'▲ ':'▼ ')+Math.abs(day.hs[day.hs.length-1].p-day.hs[0].p).toFixed(1)} today</span></div>${chart(pts,'p',{day,legal:lg,color:'#3ecf8e',span:4})}</div>
       <div class="card"><b>Factor breakdown (prime windows)</b><div class="facts" style="margin-top:8px">${fsRow}</div>${day.rp?`<div class="msg" style="color:#5aa9ff">Precipitation includes your report (${getRain(l).lvl==='dry'?'not raining':CFG.RAIN_REPORT[getRain(l).lvl][1].toLowerCase()+' rain'}, ${fmtClock(getRain(l).at)}) for the current and next 2 hours.</div>`:''}</div>
-      <div class="note">${lg?`Legal hours: ${lg.r.rule} (<a href="${lg.r.src}" target="_blank" rel="noopener">${lg.r.srcName}</a>). ${lg.r.note||''} `:'Legal hours shown only for MN and WI locations. '}Always confirm current regulations before you shoot. Estimate only.</div>`;
+      <div class="note">${lg?`Legal hours${lg.guess?' (state unknown, MN rule shown)':''}: ${lg.r.rule} (<a href="${lg.r.src}" target="_blank" rel="noopener">${lg.r.srcName}</a>). ${lg.r.note||''} `:'Legal hours shown only for MN and WI locations. '}Always confirm current regulations before you shoot. Estimate only.</div>`;
     view.querySelectorAll('.tab').forEach(b => b.onclick = () => { res = b.dataset.r; draw(); });
     bindCharts(pts, $('#tip'));
   };
