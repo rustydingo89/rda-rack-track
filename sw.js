@@ -1,4 +1,4 @@
-const C='rt-v9',A=['./','index.html','app.css?v=rt-v9','app.js?v=rt-v9','logo.svg','manifest.webmanifest','icon-192.png','apple-touch-icon.png'];
+const C='rt-v10',A=['./','index.html','app.css?v=rt-v10','app.js?v=rt-v10','logo.svg','manifest.webmanifest','icon-192.png','apple-touch-icon.png'];
 self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.addAll(A.map(u=>new Request(u,{cache:'reload'})))))});
 self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==C).map(x=>caches.delete(x)))).then(()=>self.clients.claim()))});
 // network-first (bypassing the HTTP cache) for all same-origin files; cache only as offline fallback

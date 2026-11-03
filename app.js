@@ -1,5 +1,5 @@
 'use strict';
-const VERSION = 'rt-v9';
+const VERSION = 'rt-v10';
 /* RDA Rack Track: whitetail movement favorability estimate. All tunables up here. */
 const CFG = {
   BASE: 50,
@@ -35,7 +35,7 @@ const CFG = {
   // Anchored on harness scenarios: thunderstorm raw 10 -> ~6, ideal rut dawn raw ~80 -> ~92, neutral 50 -> 50.
   CAL: [[0,0],[10,6],[25,18],[35,30],[50,50],[65,72],[80,92],[95,99],[100,100]],
   BANDS: [[0,35,'Poor','#ff5d5d'],[35,50,'Fair','#f2b84b'],[50,65,'Good','#a6d94a'],[65,80,'Great','#3ecf8e'],[80,101,'Prime','#2ee6c8']],
-  CACHE_MIN: 30, KEY_LOCS: 'rt_locs', KEY_CACHE: 'rt_wx3_', BLEND_MODELS: 'ecmwf_ifs025,gem_seamless', AGREE: [[4,0.15,'High'],[8,0.5,'Medium'],[999,999,'Low']]
+  CACHE_MIN: 30, KEY_LOCS: 'rt_locs', KEY_CACHE: 'rt_wx4_', MOON_PTS: 3, BLEND_MODELS: 'ecmwf_ifs025,gem_seamless', AGREE: [[4,0.15,'High'],[8,0.5,'Medium'],[999,999,'Low']]
 };
 const $ = s => document.querySelector(s), view = $('#view');
 const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
@@ -52,6 +52,17 @@ const cal = r => { const C = CFG.CAL; r = clamp(r,0,100); for (let i=1;i<C.lengt
 // local-time strings ("2026-10-31T14:00") -> minutes on a fake UTC clock; avoids timezone bugs
 const tm = s => { const [d,t='00:00'] = s.split('T'), [y,m,dd] = d.split('-').map(Number), [h,mi] = t.split(':').map(Number); return Date.UTC(y,m-1,dd,h,mi)/6e4; };
 const fmtClock = iso => new Date(iso).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+/* moon phase: low-precision ephemeris (Meeus / SunCalc method), computed locally */
+const moonIllum = ms => { const rad = Math.PI/180, d = ms/864e5 - 10957.5, e = rad*23.4397;
+  const M = rad*(357.5291+0.98560028*d), C = rad*(1.9148*Math.sin(M)+0.02*Math.sin(2*M)+0.0003*Math.sin(3*M)), Ls = M+C+rad*102.9372+Math.PI;
+  const L = rad*(218.316+13.176396*d), Mm = rad*(134.963+13.064993*d), F = rad*(93.272+13.229350*d), lm = L+rad*6.289*Math.sin(Mm), bm = rad*5.128*Math.sin(F), dm = 385001-20905*Math.cos(Mm);
+  const ra = (l,b)=>Math.atan2(Math.sin(l)*Math.cos(e)-Math.tan(b)*Math.sin(e),Math.cos(l)), de = (l,b)=>Math.asin(Math.sin(b)*Math.cos(e)+Math.cos(b)*Math.sin(e)*Math.sin(l));
+  const sa = ra(Ls,0), sd = de(Ls,0), ma = ra(lm,bm), md = de(lm,bm);
+  const phi = Math.acos(Math.sin(sd)*Math.sin(md)+Math.cos(sd)*Math.cos(md)*Math.cos(sa-ma)), inc = Math.atan2(149598000*Math.sin(phi), dm-149598000*Math.cos(phi));
+  const ang = Math.atan2(Math.cos(sd)*Math.sin(sa-ma), Math.sin(sd)*Math.cos(md)-Math.cos(sd)*Math.sin(md)*Math.cos(sa-ma));
+  return {f:(1+Math.cos(inc))/2, p:0.5+0.5*inc*(ang<0?-1:1)/Math.PI}; };
+const MOONS = [[0.03,'🌑','New moon'],[0.22,'🌒','Waxing crescent'],[0.28,'🌓','First quarter'],[0.47,'🌔','Waxing gibbous'],[0.53,'🌕','Full moon'],[0.72,'🌖','Waning gibbous'],[0.78,'🌗','Last quarter'],[0.97,'🌘','Waning crescent'],[1.01,'🌑','New moon']];
+const moonFor = (date, off=0) => { const m = moonIllum(tm(date+'T12:00')*6e4 - off*1000), n = MOONS.find(x=>m.p<x[0]); return {f:m.f, p:m.p, icon:n[1], name:n[2], pct:Math.round(m.f*100)}; };
 const fmtT = m => { const d = new Date(m*6e4); let h = d.getUTCHours(), mi = d.getUTCMinutes(); const ap = h<12?'a':'p'; h = h%12||12; return h+(mi?':'+String(mi).padStart(2,'0'):'')+ap; };
 
 function rutFor(dateStr){ const [,m,d] = String(dateStr).slice(0,10).split('-').map(Number), k = m*100+d;
@@ -87,7 +98,7 @@ async function weather(loc, force){
   let c; try { c = JSON.parse(localStorage.getItem(key)); } catch {}
   if (c && !force && Date.now()-c.t < CFG.CACHE_MIN*6e4) return c;
   try {
-    const u = `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}&hourly=${HV}&minutely_15=${MV}&daily=sunrise,sunset&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&past_days=1&forecast_days=7`;
+    const u = `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}&hourly=${HV}&minutely_15=${MV}&daily=sunrise,sunset,moonrise,moonset&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&past_days=1&forecast_days=7`;
     const r = await fetch(u); if (!r.ok) throw new Error('HTTP '+r.status);
     const d = await r.json();
     // Multi-model blend: median of Open-Meteo best match (GFS/HRRR in US) + ECMWF + GEM. If the extra call fails, single model is used.
@@ -185,6 +196,7 @@ function scoreHour(x){
   f.cloud = (x.cc<30 ? (x.t>=S.warmF?S.clearWarm:x.t<S.coolF?S.clearCool:0) : x.cc<85 ? S.partly : (x.t>=S.warmF?S.overcastWarm:x.t<S.coolF?S.overcastCool:0))*k;
   f.press = (x.d3 <= CFG.PRESS_FALL_3H ? CFG.PRESS_FALL_PTS : (x.d3 >= CFG.POST_FRONT_RISE_3H && x.d12 <= CFG.POST_FRONT_FALL_12H) ? CFG.POST_FRONT_PTS : x.p >= CFG.PRESS_HIGH ? CFG.PRESS_HIGH_PTS : 0)*k;
   f.rut = rutFor(x.time).bonus;
+  f.moon = x.prime && x.moon!=null ? (0.5 - x.moon)*CFG.MOON_PTS : 0; // weak evidence: dark nights → slightly more dawn/dusk movement
   const dry = clamp(CFG.BASE + Object.values(f).reduce((a,b)=>a+b,0), 0, 100);
   const codeWet = x.code!=null && (x.code==45||x.code==48||x.code>=51);
   let q = x.sure ? 1 : Math.max((x.pp||0)/100, codeWet?0.6:0, x.pr>0.004?0.5:0);
@@ -215,9 +227,9 @@ function model(d, nr, rep){
     if (dryRep && code>=51) code = 3; else if (rp && !(code>=51)) code = null;
     const day = H.time[i].slice(0,10), dl = d.daily.time.indexOf(day), srm = dl>=0?tm(d.daily.sunrise[dl]):0, ssm = dl>=0?tm(d.daily.sunset[dl]):0;
     const prime = dl>=0 && ((T[i] >= srm+CFG.PRIME_DAWN[0] && T[i] <= srm+CFG.PRIME_DAWN[1]) || (T[i] >= ssm+CFG.PRIME_DUSK[0] && T[i] <= ssm+CFG.PRIME_DUSK[1]));
-    const r = scoreHour({t, t24, w, g:H.wind_gusts_10m[i], cc, pr, pp, code, d3, d12, p:p[i], time:H.time[i], prime, sure: !dryRep && (rp || (live && nr.wet))});
+    const r = scoreHour({t, t24, w, g:H.wind_gusts_10m[i], cc, pr, pp, code, d3, d12, p:p[i], time:H.time[i], prime, moon: moonFor(day, d.utc_offset_seconds).f, sure: !dryRep && (rp || (live && nr.wet))});
     const s = r.s; Object.assign(f, r.f);
-    hours.push({i, m:T[i], time:H.time[i], s, f, t, t24, w, g:H.wind_gusts_10m[i], wd, cc, pr, pp:pp||0, p:p[i], dp:d3, d12, code, prime, live, rp, wc:r.wc, q:r.q});
+    hours.push({moon: moonFor(day, d.utc_offset_seconds).f, i, m:T[i], time:H.time[i], s, f, t, t24, w, g:H.wind_gusts_10m[i], wd, cc, pr, pp:pp||0, p:p[i], dp:d3, d12, code, prime, live, rp, wc:r.wc, q:r.q});
   }
   const days = d.daily.time.map((date, k) => {
     const sr = tm(d.daily.sunrise[k]), ss = tm(d.daily.sunset[k]);
@@ -228,8 +240,9 @@ function model(d, nr, rep){
     const pa = avg(prime), ma = avg(mid);
     const score = Math.round(pa==null ? (avg(hs)||0) : ma==null ? pa : pa*CFG.DAY_WEIGHTS.prime + ma*CFG.DAY_WEIGHTS.midday);
     const src = prime.length ? prime : hs, fs = {};
-    for (const key of ['temp','change','wind','cloud','precip','press','rut']) fs[key] = src.reduce((a,h)=>a+h.f[key],0)/(src.length||1);
-    return {date, k, sr, ss, hs, rp: hs.some(h=>h.rp), score, fs, reason: reason(fs, hs, src, prime), rut: rutFor(date), agree: d.blend && d.blend.agree[date]};
+    for (const key of ['temp','change','wind','cloud','precip','press','rut','moon']) fs[key] = src.reduce((a,h)=>a+h.f[key],0)/(src.length||1);
+    const D = d.daily, mr = D.moonrise&&D.moonrise[k], ms = D.moonset&&D.moonset[k];
+    return {moon: Object.assign(moonFor(date, d.utc_offset_seconds), {rise: mr?tm(mr):null, set: ms?tm(ms):null}), date, k, sr, ss, hs, rp: hs.some(h=>h.rp), score, fs, reason: reason(fs, hs, src, prime), rut: rutFor(date), agree: d.blend && d.blend.agree[date]};
   });
   return {hours, days: days.slice(1)}; // drop the past day (only used for day-over-day change)
 }
@@ -240,7 +253,7 @@ function reason(fs, hs, src, prime){
   const P = prime && prime.length ? prime : src, ppMax = Math.max(0, ...P.map(h=>h.pp||0)), wet = P.filter(h=>h.wc && h.wc!=='snowLight');
   if (wet.length && fs.precip <= -4 && (ppMax >= 25 || wet.some(h=>h.rp||h.live))) { const worst = wet.reduce((a,h)=>CFG.WET[h.wc][1]<CFG.WET[a.wc][1]?h:a);
     tx.push(`− ${CFG.WET[worst.wc][2].toLowerCase()} ${worst.rp||worst.live&&worst.pp>=100?'now':ppMax+'% chance'} at dawn/dusk`); }
-  const ranked = Object.entries(fs).filter(([k])=>k!=='precip'&&k!=='rut').sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]));
+  const ranked = Object.entries(fs).filter(([k])=>k!=='precip'&&k!=='rut'&&k!=='moon').sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]));
   const say = {temp:v=> v>0?`cool ${Math.round(tAvg)}°F`:`warm ${Math.round(tAvg)}°F`,
     change:v=> v>0?'temps dropping vs yesterday':'warmer than yesterday',
     wind:v=> v>0?`${Math.round(wAvg)} mph ${dir} wind`:`${Math.round(wAvg)} mph ${dir} wind`,
@@ -257,7 +270,7 @@ function fine(d, mdl, day){
     const m = tm(M.time[j]), hi = hs.findIndex(h => h.m > m) - 1; if (hi < 0) continue;
     const h = hs[hi];
     const pr15 = Math.max(effPr((M.precipitation[j]||0)*4, M.weather_code&&M.weather_code[j], h.pp), (h.live||h.rp)?h.pr:0);
-    const r = scoreHour({t:M.temperature_2m[j], t24:h.t24, w:M.wind_speed_10m[j], g:M.wind_gusts_10m[j], cc:h.cc, pr:pr15, pp:h.pp, code:(h.live||h.rp)?h.code:(M.weather_code?M.weather_code[j]:h.code), d3:h.dp, d12:h.d12, p:h.p, time:h.time, prime:h.prime, sure:h.live&&h.q===1||h.rp});
+    const r = scoreHour({t:M.temperature_2m[j], t24:h.t24, w:M.wind_speed_10m[j], g:M.wind_gusts_10m[j], cc:h.cc, pr:pr15, pp:h.pp, code:(h.live||h.rp)?h.code:(M.weather_code?M.weather_code[j]:h.code), d3:h.dp, d12:h.d12, p:h.p, time:h.time, prime:h.prime, moon:h.moon, sure:h.live&&h.q===1||h.rp});
     out.push({m, s: r.s, t:M.temperature_2m[j], w:M.wind_speed_10m[j], g:M.wind_gusts_10m[j], wd:M.wind_direction_10m[j], pr:pr15, cc:h.cc, p:h.p, dp:h.dp, pp:h.pp});
   }
   return out.length > 40 ? out : null;
@@ -293,7 +306,8 @@ function migrateLocs(){ const L = getLocs(); let ch = 0; L.forEach(l => { const 
 try { migrateLocs(); } catch {}
 const legalFor = (l, day) => { const k = locState(l), r = LEGAL[k||'MN']; return {a: day.sr - r.pre, b: day.ss + r.post, r, st:k||'MN', guess:!k}; };
 const agreeTxt = d => d.agree ? `<br><small class="agree" style="color:${d.agree.lvl==='High'?'#3ecf8e':d.agree.lvl==='Medium'?'#f2b84b':'#ff8a5d'}">Models agree: ${d.agree.lvl}</small>` : '';
-const legalLine = (l, d, big) => { const lg = legalFor(l, d); return `<div class="sun">☀ Sunrise ${fmtT(d.sr)} · Sunset ${fmtT(d.ss)}</div><div class="legal${big?' big':''}"><div class="lt">Legal shooting time: ${fmtT(lg.a)} – ${fmtT(lg.b)}</div><small class="rule">${lg.st}${lg.guess?' rule (state unknown)':''}: ${lg.r.rule}</small></div>`; };
+const legalLine = (l, d, big) => { const lg = legalFor(l, d); return `<div class="sun">☀ Sunrise ${fmtT(d.sr)} · Sunset ${fmtT(d.ss)}</div><div class="legal${big?' big':''}"><div class="lt">Legal shooting time: ${fmtT(lg.a)} – ${fmtT(lg.b)}</div><small class="rule">${lg.st}${lg.guess?' rule (state unknown)':''}: ${lg.r.rule}</small></div>${moonLine(d)}`; };
+const moonLine = d => { const m = d.moon; if (!m) return ''; const rs = [m.rise!=null?'rise '+fmtT(m.rise):'', m.set!=null?'set '+fmtT(m.set):''].filter(Boolean).join(' · '); return `<div class="moon">${m.icon} Moon: ${m.name} · ${m.pct}% lit${rs?' · '+rs:''}</div>`; };
 const stPicker = l => locState(l) ? '' : `<div class="legal pick">State not detected — using MN rule. Set state: <button class="sg" data-st="MN">MN</button><button class="sg" data-st="WI">WI</button></div>`;
 /* ---------- SVG charts ---------- */
 function chart(pts, key, opt){
@@ -400,7 +414,7 @@ function detail(idx, k){
     const sv = pts.map(p=>p.s), slo = Math.max(0, Math.min(...sv)-8), shi = Math.min(100, Math.max(...sv)+8), sp = Math.max(30, shi-slo), smid = (slo+shi)/2;
     const smin = Math.max(0, Math.min(100-sp, smid-sp/2)), smax = smin+sp;
     const chip = (n,v) => v==null?'':`<span>${n} <b style="color:${color(v)}">${v}</b></span>`;
-    const fsRow = Object.entries(day.fs).map(([kk,v])=>`<div class="fact"><small>${{temp:'Temperature',change:'Change vs yesterday',wind:'Wind',cloud:'Sky (cloud × temp)',precip:'Rain / snow / fog',press:'Pressure / fronts',rut:'Rut phase'}[kk]}</small><b style="color:${v>0.5?'#3ecf8e':v<-0.5?'#ff5d5d':'#e6e9ee'}">${v>0?'+':''}${v.toFixed(1)} pts</b></div>`).join('');
+    const fsRow = Object.entries(day.fs).map(([kk,v])=>`<div class="fact"><small>${{temp:'Temperature',change:'Change vs yesterday',wind:'Wind',cloud:'Sky (cloud × temp)',precip:'Rain / snow / fog',press:'Pressure / fronts',rut:'Rut phase',moon:'Moon phase'}[kk]}</small><b style="color:${v>0.5?'#3ecf8e':v<-0.5?'#ff5d5d':'#e6e9ee'}">${v>0?'+':''}${v.toFixed(1)} pts</b></div>`).join('');
     view.innerHTML = `<div class="card"><div class="ch"><h3>${esc(l.name)} · ${DOW[dt.getUTCDay()]} ${dt.getUTCMonth()+1}/${dt.getUTCDate()}</h3><div class="sc" style="background:${color(day.score)}">${day.score}</div></div>
       <div class="why"><b>${label(day.score)}</b> · ${esc(day.reason)}</div>${legalLine(l, day, 1)}
       <div class="facts" style="margin-top:10px"><div class="fact"><small>Sunrise / Sunset</small><b>${fmtT(day.sr)} / ${fmtT(day.ss)}</b></div><div class="fact"><small>Best hour (daylight)</small><b>${fmtT(best.m)} · ${best.s}</b></div><div class="fact"><small>Legal shooting hours (${lg.st}${lg.guess?'?':''})</small><b style="color:#3ecf8e">${lgTxt}</b></div><div class="fact"><small>Forecast agreement (3 models)</small><b>${day.agree?`${day.agree.lvl} · ±${(day.agree.t/2).toFixed(1)}°F, rain ${day.agree.p.toFixed(2)}" spread`:'single model'}</b></div><div class="fact"><small>Rut phase</small><b>${day.rut.name}${day.rut.bonus?' +'+day.rut.bonus:''}</b></div><div class="fact"><small>Prevailing wind (daylight)</small><b>${prevail(day.hs.filter(h=>h.m>=day.sr&&h.m<=day.ss))} · ${Math.round(Math.max(...day.hs.map(h=>h.w)))} mph max</b></div><div class="fact"><small>Temp range</small><b>${Math.round(Math.min(...day.hs.map(h=>h.t)))}–${Math.round(Math.max(...day.hs.map(h=>h.t)))}°F</b></div></div></div>
@@ -474,7 +488,13 @@ const STUDIES = [
  {t:'Can multi-model combination really enhance the prediction skill of probabilistic ensemble forecasts?', a:'Weigel, Liniger, Appenzeller (Q. J. R. Meteorol. Soc.)', y:2008, u:'https://doi.org/10.1002/qj.210', f:'weather sources', c:'Strong (forecasting)',
   x:'Multi-model combinations can beat the best single model mainly by cancelling overconfidence. Basis for blending 3 models.', r:'abstract'},
  {t:'National Blend of Models (NBM) Temperature verification', a:'NOAA Colorado Basin RFC', y:2018, u:'https://www.cbrfc.noaa.gov/present/projects/NBM_Temperature.pdf', f:'weather sources', c:'Moderate',
-  x:'Verification over days 1–10: blended (and bias-corrected) NBM temperature beat single-model GFS MOS; NWS now starts from the blend.', r:'full PDF'}];
+  x:'Verification over days 1–10: blended (and bias-corrected) NBM temperature beat single-model GFS MOS; NWS now starts from the blend.', r:'full PDF'},
+ {t:'Moon phase: summary (weak / mixed evidence)', a:'Rack Track notes, from the studies listed here', y:2026, u:'https://www.deer.psu.edu/wandering-in-the-moonlight/', f:'moon', c:'Weak / mixed',
+  x:'Large GPS studies (Webb 2010; MSU 48 bucks; Penn State does) found no meaningful moon-phase effect on movement; PSU saw only ~6 m/hr more under new vs full moon. Two GPS solunar studies (below) found lunar timing associations. The app gives moon only a tiny weight.', r:'full page'},
+ {t:'Movement with the Moon: White-tailed Deer Activity and Solunar Events', a:'Sullivan et al. (J. Southeastern Assoc. Fish & Wildlife Agencies)', y:2016, u:'https://seafwa.org/sites/default/files/journal-articles/Movement%252520with%252520the%252520Moon_%252520White-tailed%252520Deer%252520Activity%252520and%252520Solunar%252520Events-2016-03-01.pdf', f:'moon', c:'Weak / mixed',
+  x:'38 GPS-collared bucks, SC, Aug–Dec 2010–12. Some association of activity with moonrise/moonset/overhead periods, but day, night, sunrise, sunset and 24-hr activity were not affected by proximity to new or full moon.', r:'abstract + discussion'},
+ {t:'Are Solunar Charts as Predictable as They Claim? Comparing Solunar Ratings to Activity Patterns of Male White-tailed Deer', a:'Swartout et al. (Southeastern Naturalist 24(2))', y:2025, u:'https://www.eaglehill.us/SENAonline/articles/SENA-24-2/14-Swartout.shtml', f:'moon', c:'Weak / mixed',
+  x:'22 GPS bucks, fenced AL property, Dec–Feb. Solunar charts were inconsistent predictors, but activity did vary with lunar events and phase; authors call for more research.', r:'abstract'}];
 const EVID = [ // factor, range in app, evidence, why
  ['Rain / drizzle / storm','× 0.35–0.70, capped 10–40','Moderate (bucks)','PSU collars, replicated 2 yrs: bucks ~35–40% less travel in rain; does unaffected. Auburn saw no drop in drizzle. Wind offsets it.'],
  ['Rut phase','+3 to +10','Strong','MSU (48 bucks), Webb (+20%), WI DNR 188 bucks (peak Oct 23–Nov 12): rut timing beats any weather factor. v9 calendar follows the WI dates.'],
@@ -486,7 +506,7 @@ const EVID = [ // factor, range in app, evidence, why
  ['Snow','light ×0.95 · heavy ×0.55','Weak','No collar data found; light snow left near neutral, heavy snow treated like steady rain.'],
  ['Pressure / fronts','0 to +3 (v9: falling-baro bonus removed)','Weak / conflicting','Webb, MSU, NDA/PSU: no consistent effect. Auburn full thesis: activity usually lower while pressure falls fast, higher as it rises. Only post-front rise gets a small bonus.'],
  ['Temp change vs yesterday','−6 to +8','Weak','PSU found no change through a cold front or warm snap. Kept small.'],
- ['Moon','not used','No effect / weak','Webb, MSU (48 bucks), PSU GPS: no measurable effect. Only a 10-day camera study found one.']];
+ ['Moon phase','−1.5 to +1.5 (prime windows only, ≈ ±2 shown)','Weak / mixed','Webb, MSU (48 bucks), PSU GPS: no measurable effect on overall movement. SC (38 bucks) and AL (22 bucks) GPS work found some lunar timing effects. Tiny nudge: dark (new) moon slight plus, bright full moon slight minus at dawn/dusk.']];
 const howHTML = () => `<h2>How the score works</h2>
 <p><b>Short version:</b> research says the calendar (rut) and dawn/dusk drive deer movement much more than weather. Of the weather factors, <b>rain</b> has the clearest effect on <b>bucks</b> (roughly 35–40% less travel in Penn State's collar data), then heat. Wind, clouds, pressure and fronts show weak or conflicting effects. So rain now pulls the score down hard, and the others nudge it.</p>
 <ol><li><b>Dry score</b> = 50 + temperature + change vs yesterday + wind/gusts + sky + pressure + rut. Non-rain weather terms are damped 25% in the dawn/dusk windows, because Auburn found weather matters least then.</li>
