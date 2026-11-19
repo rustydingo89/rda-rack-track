@@ -1,5 +1,5 @@
 'use strict';
-const VERSION = 'rt-v10';
+const VERSION = 'rt-v11';
 /* RDA Rack Track: whitetail movement favorability estimate. All tunables up here. */
 const CFG = {
   BASE: 50,
